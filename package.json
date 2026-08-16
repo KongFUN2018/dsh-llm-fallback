@@ -1,6 +1,13 @@
 {
   "name": "@deepseek-ai/dsh-llm-fallback",
   "description": "Automatic cross-provider model fallback with quota awareness for the DeepSeek Harness",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KongFUN2018/dsh-llm-fallback.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KongFUN2018/dsh-llm-fallback/issues"
+  },
   "version": "0.1.0",
   "license": "MIT",
   "type": "module",
