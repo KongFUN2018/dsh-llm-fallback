@@ -4,6 +4,20 @@ English | [中文](README.zh.md)
 
 Automatic cross-provider model fallback with quota awareness for the DeepSeek Harness. It installs an outer listener on the agent loop's `agent/request` waterfall and a recovery listener on `agent/request-error`, so every switch re-derives the request against the same turn/step and preserves the conversation built so far. It never wraps `ctx.llm.stream()`: each adapter call is one provider attempt, and each switch is a fresh model selection.
 
+## Setup
+
+This is a standalone repository (not part of the DeepSeek Harness monorepo). It builds and tests on its own against the published `@deepseek-ai/*` runtime packages.
+
+```bash
+npm install
+npm run build   # tsc emits lib/types/*.js + .d.ts, then tsdown bundles lib/
+npm test        # 42 vitest tests
+```
+
+Requirements: Node ≥ 24, npm (or pnpm). Runtime peer dependencies are the DeepSeek Harness packages at `0.1.0-rc.6` (`@deepseek-ai/cordis`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-credentials`, `@deepseek-ai/dsh-invariants`).
+
+To use the plugin as a dependency: `npm install @deepseek-ai/dsh-llm-fallback`, then register it in your DSH config (see [Configuration](#configuration)).
+
 ## What it does
 
 - **Fail-and-switch** — on an eligible failure code (`QUOTA`, `RATE_LIMIT`, `SERVER`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE`) it walks the configured `fallbacks` chain, skips providers with no usable model, and returns `{ kind: 'retry' }` so the loop re-derives the request with the same turn/step.

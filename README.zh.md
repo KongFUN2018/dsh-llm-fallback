@@ -4,6 +4,20 @@
 
 面向 DeepSeek Harness 的自动跨供应商模型回退与额度感知插件。它在 agent 循环的 `agent/request` 瀑布外层安装监听，并在 `agent/request-error` 安装恢复监听：每次切换都会用相同的 turn/step 重新派生请求，保留已构建的会话上下文。它不包装 `ctx.llm.stream()`——每次适配器调用都是一次供应商请求，每次切换都是一次全新的模型选择。
 
+## 安装与构建
+
+这是一个独立仓库（不属于 DeepSeek Harness monorepo）。它针对已发布的 `@deepseek-ai/*` 运行时包独立构建与测试。
+
+```bash
+npm install
+npm run build   # tsc 产出 lib/types/*.js + .d.ts，再由 tsdown 打包到 lib/
+npm test        # 42 个 vitest 测试
+```
+
+要求：Node ≥ 24，npm（或 pnpm）。运行时 peer 依赖为 DeepSeek Harness 的 `0.1.0-rc.6` 包（`@deepseek-ai/cordis`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-agent`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-credentials`、`@deepseek-ai/dsh-invariants`）。
+
+作为依赖安装：`npm install @deepseek-ai/dsh-llm-fallback`，然后在 DSH 配置里注册（见[配置](#配置)）。
+
 ## 功能
 
 - **失败即切换** —— 命中可切换失败码（`QUOTA`、`RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE`）时，沿 `fallbacks` 链推进，跳过没有可用模型的供应商，并返回 `{ kind: 'retry' }` 让循环以相同 turn/step 重新派生请求。
