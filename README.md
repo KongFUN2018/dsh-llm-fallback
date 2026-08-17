@@ -39,6 +39,16 @@ The composer's model seat deliberately keeps showing your own selection: selecti
 
 To deploy: install this package into your DSH deployment tree (the directory holding your `cordis.yml`) — `npm install @deepseek-ai/dsh-llm-fallback` — and register the node half in the config. `dsh web` then serves the browser half at `/plugins/@deepseek-ai/dsh-llm-fallback/client.js` and injects it into the boot manifest; no extra wiring.
 
+## Switching strategy modes
+
+Beyond the default lazy chain walk, `strategy` selects the switch target under an explicit objective (full design: [docs/strategy-design.md](docs/strategy-design.md)):
+
+- **`cost`** — expand every chain candidate, keep only those that clear the *task-completion floor* (modality coverage + a dynamically-sized context window: current usage + `marginTokens`, plus a disclosed allowance that covers this very request), then pick the lowest **expected cost × risk** (per-model prices with provider-level fallback; risk multiplies for routes that already failed this session and windows hugging the floor).
+- **`performance`** — same floor, then the strongest candidate by a lexicographic capability order (`reasoning` → `contextWindow` → `maxTokens`, each deciding only on a significant ratio) so outlier axes cannot hijack the pick.
+- **`closest`** (or no `strategy`) — the legacy lazy chain walk with `preference` tie-breaks.
+
+Both modes share one invariant: **the floor guarantees the switch can finish the task; the score only chooses among candidates that already can** — the cheapest model that cannot carry the context is never selected. When cost-mode candidates keep failing, the **escalation ladder** re-selects that step under `performance` after `afterFailures` (default 2) losses, putting task completion above the cost preference. Switch events carry the active `mode` (and `score` under cost) so the UI can show why a route was chosen.
+
 ## Configuration
 
 ```yaml

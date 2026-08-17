@@ -8,6 +8,40 @@
 /** Rule-based tie-break preference among capability-matched candidates. */
 export type SelectionPreference = 'closest' | 'price' | 'speed' | 'reasoning'
 
+/** One capability axis of the performance-mode lexicographic order. */
+export type StrategyAxis = 'reasoning' | 'context' | 'output'
+
+/** Switching strategy mode (see docs/strategy-design.md). */
+export type StrategyMode = 'cost' | 'performance' | 'closest'
+
+/** Strategy-mode configuration; `closest` keeps the legacy lazy chain walk. */
+export interface StrategyConfig {
+  /** Which strategy path selects the switch target. */
+  mode: StrategyMode
+  floor?: {
+    /** Tokens reserved above the current context usage (default 8192). */
+    marginTokens?: number
+  }
+  cost?: {
+    /** Multiplier on the single-request projection (default 1). */
+    futureSteps?: number
+    /** Risk multiplier for routes that already failed this session (default 2). */
+    sessionFailurePenalty?: number
+    /** Risk multiplier for windows close to the floor (default 1.5). */
+    cliffPenalty?: number
+  }
+  performance?: {
+    /** Capability axis order; default ['reasoning', 'context', 'output']. */
+    axes?: StrategyAxis[]
+    /** Ratio at which a larger window/output counts as significantly stronger (default 1.5). */
+    significantRatio?: number
+  }
+  escalation?: {
+    /** Candidate failures in cost mode before the step escalates to performance (default 2). */
+    afterFailures?: number
+  }
+}
+
 /** One ordered fallback route. */
 export interface LlmFallbackRoute {
   /** Registered provider route. */
@@ -36,6 +70,10 @@ export interface LlmFallbackEventData {
   code: string
   /** Fallback candidates remaining after this switch. */
   remaining: number
+  /** Strategy mode that selected the target, when a strategy was active. */
+  mode?: StrategyMode
+  /** The mode's score for the selected route (cost mode: projected cost), when defined. */
+  score?: number
 }
 
 /** How one provider route exposes its remaining allowance. */
@@ -97,6 +135,8 @@ export interface LlmQuotaWarningEventData {
   outputPrice?: number
   /** Warning reason. */
   reason: 'below-threshold' | 'insufficient-cost'
+  /** Strategy mode that selected the target, when a strategy was active. */
+  mode?: StrategyMode
 }
 
 /** One candidate route surfaced to a pluggable decision provider. */

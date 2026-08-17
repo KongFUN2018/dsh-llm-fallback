@@ -13,7 +13,9 @@ import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { LlmCallConfig, ModelModality } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import type { DecisionCandidateInfo, DecisionInput, DecisionProvider, LlmFallbackRoute, QuotaCheck, QuotaProvider, QuotaStaticEntry, SelectionPreference } from './types.ts'
+import type { DecisionCandidateInfo, DecisionInput, DecisionProvider, LlmFallbackRoute, QuotaCheck, QuotaProvider, QuotaStaticEntry, SelectionPreference, StrategyConfig, StrategyMode } from './types.ts'
+import type { PriceTable, StrategyCandidate, StrategySettings } from './strategy.ts'
+import { priceOf, selectByStrategy } from './strategy.ts'
 
 export type {
   DecisionCandidateInfo,
@@ -27,7 +29,14 @@ export type {
   QuotaProvider,
   QuotaStaticEntry,
   SelectionPreference,
+  StrategyAxis,
+  StrategyConfig,
+  StrategyMode,
 } from './types.ts'
+export {
+  buildFloor, comparePerformance, costScore, passesFloor, priceOf, selectByStrategy,
+} from './strategy.ts'
+export type { PriceTable, StrategyCandidate, StrategySelection, StrategySettings } from './strategy.ts'
 
 export const name = 'llm-fallback'
 
@@ -84,6 +93,8 @@ export interface Config {
   allowUnknownCapacity?: boolean
   /** Tie-break preference among capability-matched candidates; defaults to `closest`. */
   preference?: SelectionPreference
+  /** Strategy-mode selection (see docs/strategy-design.md); `closest` (or absent) keeps the legacy lazy chain walk. */
+  strategy?: StrategyConfig
   /** Pluggable LLM decision provider; falls back to rule matching on failure. */
   decisionProvider?: DecisionProvider
   /** Preemptive quota warnings. */
@@ -132,6 +143,24 @@ export const Config: z<Config> = z.object({
   allowDegrade: z.boolean().default(false),
   allowUnknownCapacity: z.boolean().default(false),
   preference: z.union(['closest', 'price', 'speed', 'reasoning']).default('closest'),
+  strategy: z.object({
+    mode: z.union(['cost', 'performance', 'closest']).required(),
+    floor: z.object({
+      marginTokens: z.number().min(1).default(8192),
+    }),
+    cost: z.object({
+      futureSteps: z.number().min(1).default(1),
+      sessionFailurePenalty: z.number().min(1).default(2),
+      cliffPenalty: z.number().min(1).default(1.5),
+    }),
+    performance: z.object({
+      axes: z.array(z.union(['reasoning', 'context', 'output'])),
+      significantRatio: z.number().min(1).default(1.5),
+    }),
+    escalation: z.object({
+      afterFailures: z.number().min(1).default(2),
+    }),
+  }),
   decisionProvider: z.any(),
   quota: z.object({
     thresholdAbsolute: z.number().min(0),
@@ -192,6 +221,10 @@ interface StepState {
   chainCursor: number
   /** Route selected by the last recovery, awaiting the re-derived request. */
   pendingRoute: ResolvedRoute | undefined
+  /** Strategy-mode failures of candidates this step chose (escalation ladder). */
+  strategyFailures: number
+  /** Mode that selected the route of the most recent request, when strategic. */
+  selectedMode: Exclude<StrategyMode, 'closest'> | undefined
 }
 
 interface AgentState {
@@ -202,6 +235,8 @@ interface AgentState {
   switchedKeys: Set<string>
   /** Failed routes excluded until the given epoch-ms timestamp. */
   bannedUntil: Map<string, number>
+  /** Exact routes that failed earlier this session (cost risk multiplier). */
+  failedRoutes: Set<string>
   /** Most recent turn number, used to retire finished-turn step state. */
   lastTurn: number | undefined
   /** The agent's primary route, recorded on first request (poll re-check target). */
@@ -349,9 +384,10 @@ function estimateInputTokens(session: Session): number {
 function estimateCost(
   quota: QuotaConfig | undefined,
   provider: string,
+  model: string,
   session: Session,
 ): { cost: number; inputPrice: number; outputPrice: number } | undefined {
-  const price = quota?.prices?.[provider]
+  const price = priceOf(quota?.prices, provider, model)
   if (price === undefined || (price.input === undefined && price.output === undefined)) return undefined
   const inputPrice = price.input ?? 0
   const outputPrice = price.output ?? 0
@@ -435,6 +471,25 @@ async function selectModel(
   return matchModel(primary, candidates, opts)
 }
 
+/** One strategy-path selection run: resolved settings plus the host services it needs. */
+interface StrategyRun {
+  mode: Exclude<StrategyMode, 'closest'>
+  settings: StrategySettings
+  session: Session
+  prices: PriceTable | undefined
+  failedRoutes: ReadonlySet<string>
+  checkQuota: (provider: string, model: string, signal: AbortSignal) => Promise<QuotaCheck | undefined>
+  signal: AbortSignal
+}
+
+/** The outcome of any selection path; strategy fields appear only when strategic. */
+interface SelectionOutcome {
+  route: ResolvedRoute
+  nextCursor: number
+  mode?: Exclude<StrategyMode, 'closest'>
+  score?: number
+}
+
 /** Walk the chain from a cursor, resolving each entry to a concrete route. */
 async function selectNext(
   ctx: Context,
@@ -445,10 +500,15 @@ async function selectNext(
   banned: ReadonlyMap<string, number>,
   now: number,
   decisionProvider?: DecisionProvider,
-): Promise<{ route: ResolvedRoute; nextCursor: number } | undefined> {
+  strategy?: StrategyRun,
+): Promise<SelectionOutcome | undefined> {
   if (decisionProvider !== undefined) {
     const decided = await selectNextByDecision(ctx, chain, cursor, primary, banned, now, decisionProvider)
     if (decided !== undefined) return decided
+  }
+  if (strategy !== undefined) {
+    const strategic = await selectNextByStrategy(ctx, chain, cursor, primary, opts, strategy, banned, now)
+    if (strategic !== undefined) return strategic
   }
   return selectNextByRules(ctx, chain, cursor, primary, opts, banned, now)
 }
@@ -565,6 +625,80 @@ async function selectNextByDecision(
   }
 }
 
+/** Strategy path (docs/strategy-design.md): expand the whole chain, apply the
+ * hard task-completion floor, then score globally under the active mode. */
+async function selectNextByStrategy(
+  ctx: Context,
+  chain: readonly LlmFallbackRoute[],
+  cursor: number,
+  primary: Capability,
+  opts: MatchOptions,
+  run: StrategyRun,
+  banned: ReadonlyMap<string, number>,
+  now: number,
+): Promise<SelectionOutcome | undefined> {
+  const inputTokens = estimateInputTokens(run.session)
+  const candidates: StrategyCandidate[] = []
+  for (let index = cursor; index < chain.length; index++) {
+    const entry = chain[index]
+    if (entry === undefined) continue
+    const ids: string[] = []
+    if (entry.model !== undefined) {
+      ids.push(entry.model)
+    } else {
+      const models = await ctx.llm.listModels(entry.provider)
+      ids.push(...models.map(model => model.id))
+    }
+    for (const id of ids) {
+      const until = banned.get(routeKey({ provider: entry.provider, model: id }))
+      if (until !== undefined && until > now) continue
+      const info = await ctx.llm.resolveModelInfo(entry.provider, id)
+      const price = priceOf(run.prices, entry.provider, id)
+      const projected = price === undefined || (price.input === undefined && price.output === undefined)
+        ? undefined
+        : (inputTokens * (price.input ?? 0) + run.settings.estimatedOutputTokens * (price.output ?? 0)) / 1_000_000
+      // Floor F4: a disclosed allowance that cannot cover this very request
+      // would switch again immediately — exclude the route up front.
+      if (projected !== undefined) {
+        const check = await run.checkQuota(entry.provider, id, run.signal)
+        if (check?.remaining !== undefined && check.remaining < projected) continue
+      }
+      candidates.push({
+        provider: entry.provider,
+        model: id,
+        chainIndex: index,
+        ...entry.reasoningEffort === undefined ? {} : { reasoningEffort: entry.reasoningEffort },
+        ...info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
+        ...info.inputModalities === undefined ? {} : { modalities: info.inputModalities },
+        ...info.defaultMaxTokens === undefined ? {} : { maxTokens: info.defaultMaxTokens },
+        ...info.reasoning === undefined ? {} : { hasReasoning: true },
+        ...price?.input === undefined ? {} : { inputPrice: price.input },
+        ...price?.output === undefined ? {} : { outputPrice: price.output },
+        ...run.failedRoutes.has(routeKey({ provider: entry.provider, model: id })) ? { sessionFailed: true } : {},
+      })
+    }
+  }
+  if (candidates.length === 0) return undefined
+  const selection = selectByStrategy(
+    candidates, run.settings, inputTokens, primary.modalities, opts.allowUnknownCapacity,
+  )
+  if (selection === undefined) return undefined
+  const candidate = selection.candidate
+  return {
+    route: {
+      provider: candidate.provider,
+      model: candidate.model,
+      ...candidate.reasoningEffort === undefined ? {} : { reasoningEffort: candidate.reasoningEffort },
+    },
+    // Stay at the winning entry: a global re-selection must still see this
+    // entry's siblings (the ban table, not the cursor, prevents revisiting
+    // a failed route) and every later entry.
+    nextCursor: candidate.chainIndex,
+    mode: selection.mode,
+    ...selection.score === undefined ? {} : { score: selection.score },
+  }
+}
+
 /**
  * Install automatic model fallback.
  * @param ctx - plugin context.
@@ -644,6 +778,42 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     allowUnknownCapacity: config.allowUnknownCapacity ?? false,
     preference: config.preference ?? 'closest',
   }
+  const strategyConfig = config.strategy
+  if (strategyConfig !== undefined) {
+    for (const axis of strategyConfig.performance?.axes ?? []) {
+      if (axis !== 'reasoning' && axis !== 'context' && axis !== 'output') {
+        throw new Error(`llm-fallback: unknown strategy axis "${String(axis)}"`)
+      }
+    }
+  }
+  const strategySettings: StrategySettings | undefined =
+    strategyConfig === undefined || strategyConfig.mode === 'closest' ? undefined : {
+      mode: strategyConfig.mode,
+      marginTokens: strategyConfig.floor?.marginTokens ?? 8192,
+      estimatedOutputTokens: quota?.estimatedOutputTokens ?? 1024,
+      futureSteps: strategyConfig.cost?.futureSteps ?? 1,
+      sessionFailurePenalty: strategyConfig.cost?.sessionFailurePenalty ?? 2,
+      cliffPenalty: strategyConfig.cost?.cliffPenalty ?? 1.5,
+      axes: strategyConfig.performance?.axes ?? ['reasoning', 'context', 'output'],
+      significantRatio: strategyConfig.performance?.significantRatio ?? 1.5,
+    }
+  const escalationAfter = strategyConfig?.escalation?.afterFailures ?? 2
+  /** The strategy run for one selection: possibly an escalated mode. */
+  const strategyRun = (
+    mode: Exclude<StrategyMode, 'closest'> | undefined,
+    session: Session,
+    failedRoutes: ReadonlySet<string>,
+    checkQuota: StrategyRun['checkQuota'],
+    signal: AbortSignal,
+  ): StrategyRun | undefined => mode === undefined || strategySettings === undefined ? undefined : {
+    mode,
+    settings: { ...strategySettings, mode },
+    session,
+    prices: quota?.prices,
+    failedRoutes,
+    checkQuota,
+    signal,
+  }
   const states = new WeakMap<Agent, AgentState>()
   const sessionAgents = new WeakMap<Session, Agent>()
   const knownAgents = new Set<Agent>()
@@ -655,7 +825,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
   const stateFor = (agent: Agent): AgentState => {
     let state = states.get(agent)
     if (state === undefined) {
-      state = { steps: new Map(), healthyRoute: undefined, switchedKeys: new Set(), bannedUntil: new Map(), lastTurn: undefined, primaryRoute: undefined }
+      state = { steps: new Map(), healthyRoute: undefined, switchedKeys: new Set(), bannedUntil: new Map(), failedRoutes: new Set(), lastTurn: undefined, primaryRoute: undefined }
       states.set(agent, state)
       totalAgents += 1
     }
@@ -673,6 +843,8 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
         lastRoute: { provider: '', model: '' },
         chainCursor: 0,
         pendingRoute: undefined,
+        strategyFailures: 0,
+        selectedMode: undefined,
       }
       state.steps.set(key, stepState)
       totalSteps += 1
@@ -722,7 +894,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     // or cannot cover the projected cost of this request.
     const quotaCheck = await checkQuota(resolved.provider, resolved.model, signal)
     const trip = quotaCheck === undefined ? { below: false } : belowThreshold(quotaCheck, quota)
-    const projected = estimateCost(quota, resolved.provider, agent.session)
+    const projected = estimateCost(quota, resolved.provider, resolved.model, agent.session)
     const costTrip = projected !== undefined
       && quotaCheck?.remaining !== undefined
       && quotaCheck.remaining < projected.cost
@@ -730,6 +902,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       const primaryCapability = await capabilityOf(ctx, resolved)
       const result = await selectNext(
         ctx, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(), decisionProvider,
+        strategyRun(strategySettings?.mode, agent.session, agentState.failedRoutes, checkQuota, signal),
       )
       if (result !== undefined) {
         agentState.switchedKeys.add(routeKey(result.route))
@@ -747,6 +920,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
             outputPrice: projected.outputPrice,
           } : {},
           reason: trip.below ? 'below-threshold' as const : 'insufficient-cost' as const,
+          ...result.mode === undefined ? {} : { mode: result.mode },
         })
         state.lastRoute = { provider: result.route.provider, model: result.route.model }
         state.chainCursor = result.nextCursor
@@ -773,15 +947,26 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     const from = state.lastRoute
     if (eligible) {
       agentState.bannedUntil.set(routeKey(from), banUntil(from.provider, cooldownMs, quota, Date.now()))
+      agentState.failedRoutes.add(routeKey(from))
     }
+    // Escalation ladder: cost-mode candidate failures escalate this step to
+    // performance mode — task completion outranks the cost preference.
+    if (eligible && state.selectedMode === 'cost') state.strategyFailures += 1
+    const effectiveMode: Exclude<StrategyMode, 'closest'> | undefined = strategySettings === undefined
+      ? undefined
+      : strategySettings.mode === 'cost' && state.strategyFailures >= escalationAfter
+        ? 'performance'
+        : strategySettings.mode
     const primaryCapability = await capabilityOf(ctx, primary)
     const result = await selectNext(
       ctx, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(), decisionProvider,
+      strategyRun(effectiveMode, agent.session, agentState.failedRoutes, checkQuota, signal),
     )
     if (result === undefined) return next()
     agentState.switchedKeys.add(routeKey(result.route))
     state.pendingRoute = result.route
     state.chainCursor = result.nextCursor
+    state.selectedMode = result.mode
     agent.session.append('llm/fallback', {
       turn,
       step,
@@ -791,6 +976,8 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       toModel: result.route.model,
       code: failure.code,
       remaining: chain.length - result.nextCursor,
+      ...result.mode === undefined ? {} : { mode: result.mode },
+      ...result.score === undefined ? {} : { score: result.score },
     })
     return { kind: 'retry' as const }
   })

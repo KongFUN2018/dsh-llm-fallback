@@ -39,6 +39,16 @@ npm test        # 42 个 vitest 测试
 
 部署方式：把本包安装进 DSH 部署树（即存放 `cordis.yml` 的目录）—— `npm install @deepseek-ai/dsh-llm-fallback` —— 并在配置中注册节点端。`dsh web` 会自动把浏览器端以 `/plugins/@deepseek-ai/dsh-llm-fallback/client.js` 提供并注入 boot manifest，无需额外接线。
 
+## 切换策略模式
+
+除默认的惰性链遍历外，`strategy` 以显式目标选择切换目标（完整设计见 [docs/strategy-design.md](docs/strategy-design.md)）：
+
+- **`cost`（性价比）** —— 展开链上全部候选，只保留通过**任务支撑地板**者（模态覆盖 + 动态上下文窗口：当前用量 + `marginTokens`，且披露额度须覆盖本次请求），然后选**期望成本 × 风险**最低者（per-model 价格、provider 级回退；本会话失败过的路由与贴地板的窗口施加风险乘数）。
+- **`performance`（性能）** —— 同一地板，按能力词典序（`reasoning` → `contextWindow` → `maxTokens`，每轴仅在显著比值下分胜负）选最强者，离群轴无法劫持选择。
+- **`closest`（或不配 `strategy`）** —— 原惰性链遍历 + `preference` 平局偏好。
+
+两模式共享一条不变式：**地板保证切换能完成任务，评分只在能完成者中选择**——撑不起上下文的最便宜模型永远不会被选中。性价比模式候选连续失败时，**升级阶梯**在 `afterFailures`（默认 2）次后以性能模式重新选择该步，任务完成优先于成本偏好。切换事件携带生效的 `mode`（性价比模式还有 `score`），界面可解释每次选择的原因。
+
 ## 配置
 
 ```yaml

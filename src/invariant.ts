@@ -7,6 +7,9 @@ import type {} from './index.ts'
 
 const PACKAGE_NAME = '@deepseek-ai/dsh-llm-fallback'
 
+/** The strategy-mode vocabulary shared by both switch events. */
+const STRATEGY_MODES = "'cost' | 'performance' | 'closest'"
+
 /** Cordis companion plugin name. */
 export const name = 'llm-fallback-invariant'
 /** Service required before the companion can reserve package ownership. */
@@ -18,7 +21,7 @@ function validateFallback(
   event: SessionEvent<'llm/fallback'>,
   fail: InvariantFailure,
 ): void {
-  const { turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining } = event.data
+  const { turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining, mode, score } = event.data
   if (!Number.isSafeInteger(turn) || turn < 1) fail('llm/fallback turn must be a positive safe integer')
   if (!Number.isSafeInteger(step) || step < 1) fail('llm/fallback step must be a positive safe integer')
   if (typeof fromProvider !== 'string' || fromProvider.length === 0) fail('llm/fallback fromProvider must be a non-empty string')
@@ -27,6 +30,12 @@ function validateFallback(
   if (typeof toModel !== 'string' || toModel.length === 0) fail('llm/fallback toModel must be a non-empty string')
   if (typeof code !== 'string' || code.length === 0) fail('llm/fallback code must be a non-empty string')
   if (!Number.isSafeInteger(remaining) || remaining < 0) fail('llm/fallback remaining must be a non-negative safe integer')
+  if (mode !== undefined && mode !== 'cost' && mode !== 'performance' && mode !== 'closest') {
+    fail(`llm/fallback mode must be ${STRATEGY_MODES} when present`)
+  }
+  if (score !== undefined && (typeof score !== 'number' || !Number.isFinite(score) || score < 0)) {
+    fail('llm/fallback score must be a finite non-negative number when present')
+  }
   if (fromProvider === toProvider && fromModel === toModel) fail('llm/fallback must switch to a different route')
 
   const turnBoundary = history.findLast(prior => prior.type === 'turn/start' || prior.type === 'turn/end')
@@ -45,7 +54,7 @@ function validateWarning(
   event: SessionEvent<'llm/quota-warning'>,
   fail: InvariantFailure,
 ): void {
-  const { turn, step, provider, model, remaining, total, threshold, estimatedCost, inputPrice, outputPrice, reason } = event.data
+  const { turn, step, provider, model, remaining, total, threshold, estimatedCost, inputPrice, outputPrice, reason, mode } = event.data
   if (!Number.isSafeInteger(turn) || turn < 1) fail('llm/quota-warning turn must be a positive safe integer')
   if (!Number.isSafeInteger(step) || step < 1) fail('llm/quota-warning step must be a positive safe integer')
   if (typeof provider !== 'string' || provider.length === 0) fail('llm/quota-warning provider must be a non-empty string')
@@ -57,6 +66,9 @@ function validateWarning(
   if (inputPrice !== undefined && (typeof inputPrice !== 'number' || inputPrice < 0)) fail('llm/quota-warning inputPrice must be non-negative when present')
   if (outputPrice !== undefined && (typeof outputPrice !== 'number' || outputPrice < 0)) fail('llm/quota-warning outputPrice must be non-negative when present')
   if (reason !== 'below-threshold' && reason !== 'insufficient-cost') fail('llm/quota-warning reason must be a known reason')
+  if (mode !== undefined && mode !== 'cost' && mode !== 'performance' && mode !== 'closest') {
+    fail(`llm/quota-warning mode must be ${STRATEGY_MODES} when present`)
+  }
 
   const turnBoundary = history.findLast(prior => prior.type === 'turn/start' || prior.type === 'turn/end')
   if (turnBoundary?.type !== 'turn/start') fail('llm/quota-warning must be appended inside an open turn')
