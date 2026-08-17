@@ -28,6 +28,17 @@ To use the plugin as a dependency: `npm install @deepseek-ai/dsh-llm-fallback`, 
 - **Quota-kind-aware bans** — a recharge `balance` at zero bans permanently, a resetting `quota` bans until `resetAt`, transient failures cool down for `cooldownMs`, and unobservable routes only trial-and-error.
 - **Optional LLM decision** — a pluggable `decisionProvider` receives the primary capability plus the expanded candidate list and may pick any route; a throw, timeout, or invalid route falls back to rule matching.
 
+## Web UI notice rows
+
+The package ships a browser companion (declared through its `dsh.client` field) that the DSH web shell loads automatically whenever the node half is loaded. It registers two Conversation Definitions plus two keyed chat renderers, so the durable events surface where they happened:
+
+- **`llm/fallback`** renders one muted row per switch — `⇄ Switched model automatically: ds/chat → gl/haiku · reason QUOTA · 2 fallback route(s) left`.
+- **`llm/quota-warning`** renders one row per preemptive switch — `⚠ Quota warning: ds/chat has 10 left (threshold 20) — switched preemptively`.
+
+The composer's model seat deliberately keeps showing your own selection: selection is intent, routing is the plugin's job. The actual model behind each reply remains visible per message in the Trajectory view's provenance, and these rows mark every switch inline.
+
+To deploy: install this package into your DSH deployment tree (the directory holding your `cordis.yml`) — `npm install @deepseek-ai/dsh-llm-fallback` — and register the node half in the config. `dsh web` then serves the browser half at `/plugins/@deepseek-ai/dsh-llm-fallback/client.js` and injects it into the boot manifest; no extra wiring.
+
 ## Configuration
 
 ```yaml

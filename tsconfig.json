@@ -9,6 +9,7 @@
     "skipLibCheck": true,
     "esModuleInterop": true,
     "allowImportingTsExtensions": true,
+    "jsx": "react-jsx",
     "rewriteRelativeImportExtensions": true,
     "verbatimModuleSyntax": false,
     "strict": true,

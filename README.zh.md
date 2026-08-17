@@ -28,6 +28,17 @@ npm test        # 42 个 vitest 测试
 - **按额度形态禁选** —— 充值 `balance` 耗尽即永久禁选；定时 `quota` 禁选至 `resetAt`；瞬时失败按 `cooldownMs` 冷却；不可观测路由只试错。
 - **可选 LLM 决策** —— 可插拔 `decisionProvider` 收到主路由能力与展开后的候选列表，可任选路由；抛错、超时或非法路由自动回退规则匹配。
 
+## Web 界面提示行
+
+本包内置浏览器端伴生插件（通过包内 `dsh.client` 字段声明），DSH web 外壳在加载节点端的同时会自动加载它。它注册两个会话定义与两个键控聊天渲染器，把持久事件呈现在发生切换的确切位置：
+
+- **`llm/fallback`** 每次切换渲染一行淡色提示 —— `⇄ 已自动切换模型：ds/chat → gl/haiku · 原因 QUOTA · 还可回退 2 个路由`。
+- **`llm/quota-warning`** 每次提前切换渲染一行 —— `⚠ 额度预警：ds/chat 剩余 10（阈值 20），已提前切换`。
+
+输入框的模型座位刻意继续显示你自己的选择：选择表达意图，路由由插件负责。每条回复实际使用的模型仍可在 Trajectory 视图的 provenance 中逐条查看，而这些提示行在会话内标记每一次切换。
+
+部署方式：把本包安装进 DSH 部署树（即存放 `cordis.yml` 的目录）—— `npm install @deepseek-ai/dsh-llm-fallback` —— 并在配置中注册节点端。`dsh web` 会自动把浏览器端以 `/plugins/@deepseek-ai/dsh-llm-fallback/client.js` 提供并注入 boot manifest，无需额外接线。
+
 ## 配置
 
 ```yaml
