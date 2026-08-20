@@ -68,7 +68,10 @@ export interface LlmFallbackEventData {
   toModel: string
   /** Stable provider-neutral failure code that triggered the switch. */
   code: string
-  /** Fallback candidates remaining after this switch. */
+  /** Chain positions remaining after this switch — the count of fallback
+   * chain entries at or after the selected route (not a count of guaranteed
+   * viable candidates; under strategy/decision selection some may be banned
+   * or fail the floor). */
   remaining: number
   /** Strategy mode that selected the target, when a strategy was active. */
   mode?: StrategyMode

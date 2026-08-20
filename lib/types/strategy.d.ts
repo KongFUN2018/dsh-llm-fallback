@@ -81,7 +81,9 @@ export declare function buildFloor(inputTokens: number, marginTokens: number): n
  * Whether one candidate clears the hard floor: modality coverage plus a
  * dynamically-sized context window. Unknown windows fail the floor unless
  * explicitly allowed (they cannot be verified, and the strategy path
- * demands verifiability).
+ * demands verifiability); with `allowUnknownCapacity` set they are kept but
+ * ranked strictly below every floor-passing candidate with a known window
+ * (see {@link selectByStrategy}).
  * @param candidate - expanded candidate.
  * @param floor - minimum acceptable context window.
  * @param requiredModalities - modalities the primary route required.
@@ -113,6 +115,10 @@ export declare function comparePerformance(a: StrategyCandidate, b: StrategyCand
 /**
  * Select the switch target among expanded candidates under the active mode:
  * floor first, then the mode's soft objective, then deterministic tie-breaks.
+ * Unknown-window candidates (when `allowUnknownCapacity`) are tiered strictly
+ * below every known-window candidate that clears the floor: they are only
+ * reached when no floor-passing candidate has a known window, and are then
+ * settled by chain position, then id (docs/strategy-design.md §四 F2).
  * @param candidates - every expanded, ban-filtered candidate.
  * @param settings - resolved strategy settings.
  * @param inputTokens - estimated tokens of the current request.

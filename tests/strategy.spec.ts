@@ -131,6 +131,35 @@ describe('strategy pure layer', () => {
     const pool = [candidate({ model: 'small', contextWindow: 4096 })]
     expect(selectByStrategy(pool, COST_SETTINGS, 1000, undefined, false)).toBeUndefined()
   })
+
+  it('selectByStrategy ranks an allowed unknown-window candidate strictly last', () => {
+    const pools = [
+      // Even a costlier known-window candidate outranks a cheaper unknown one.
+      candidate({ model: 'known-big', contextWindow: 65_536, inputPrice: 5, outputPrice: 10, chainIndex: 1 }),
+      candidate({ model: 'unknown-cheap', contextWindow: undefined, inputPrice: 0.01, outputPrice: 0.01, chainIndex: 0 }),
+    ]
+    // cost mode: the unknown tier is never scored, so the known winner wins
+    // despite its higher price.
+    const costPick = selectByStrategy(pools, COST_SETTINGS, 1000, undefined, true)
+    expect(costPick?.candidate.model).toBe('known-big')
+    expect(costPick?.score).toBeTruthy()
+    // performance mode: same tiering — a known window outranks an unknown one.
+    // (no unknown at all → settled by chain position then id)
+    const perfPick = selectByStrategy(pools, PERF_SETTINGS, 1000, undefined, true)
+    expect(perfPick?.candidate.model).toBe('known-big')
+  })
+
+  it('selectByStrategy falls back to the unknown tier in chain order when nothing is known', () => {
+    const pool = [
+      candidate({ model: 'z', contextWindow: undefined, chainIndex: 1 }),
+      candidate({ model: 'a', contextWindow: undefined, chainIndex: 0 }),
+    ]
+    for (const settings of [COST_SETTINGS, PERF_SETTINGS]) {
+      const pick = selectByStrategy(pool, settings, 1000, undefined, true)
+      expect(pick?.candidate.model).toBe('a')
+      expect(pick?.score).toBeUndefined()
+    }
+  })
 })
 
 /* --------------------------- integration ----------------------------- */
@@ -449,5 +478,36 @@ describe('llm-fallback strategy integration', () => {
     expect(events).toHaveLength(1)
     expect('mode' in events[0]!.data).toBe(false)
     expect('score' in events[0]!.data).toBe(false)
+  })
+
+  it('S9 an allowed unknown-window model is a last resort even when cheaper', async () => {
+    const h = await harness({
+      ds: [new LlmError('quota', 'QUOTA', { status: 402 })],
+      a: [textResponse('known-ok')],
+    }, {
+      fallbacks: [{ provider: 'a' }],
+      strategy: { mode: 'cost' },
+      allowUnknownCapacity: true,
+      quota: {
+        prices: {
+          'a/known': { input: 5, output: 10 },
+          'a/mystery': { input: 0.01, output: 0.01 },
+        },
+      },
+    }, {
+      a: [
+        { id: 'mystery' }, // no contextWindow in the catalog → unknown capacity
+        { id: 'known', contextWindow: 65_536 },
+      ],
+    })
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('s9-unknown-last'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // 'mystery' is ~500× cheaper but its window is unverifiable — the known
+    // candidate clears the floor and outranks it.
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
+      .toEqual(['ds/chat', 'a/known'])
   })
 })
