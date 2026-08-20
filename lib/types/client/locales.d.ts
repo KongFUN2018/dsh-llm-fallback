@@ -13,6 +13,7 @@ export declare const zh: {
     'warning.belowThreshold': string;
     'warning.insufficientCost': string;
     'warning.belowThresholdUnknown': string;
+    'warning.unobservableProbe': string;
 };
 /** The llmFallback namespace key union. */
 export type FallbackKey = keyof typeof zh;
@@ -26,5 +27,6 @@ export declare const en: {
     'warning.belowThreshold': string;
     'warning.insufficientCost': string;
     'warning.belowThresholdUnknown': string;
+    'warning.unobservableProbe': string;
 };
 //# sourceMappingURL=locales.d.ts.map

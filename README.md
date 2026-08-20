@@ -11,7 +11,7 @@ This is a standalone repository (not part of the DeepSeek Harness monorepo). It 
 ```bash
 npm install
 npm run build   # tsc emits lib/types/*.js + .d.ts, then tsdown bundles lib/
-npm test        # 78 vitest tests
+npm test        # 81 vitest tests
 ```
 
 Requirements: Node ≥ 24, npm (or pnpm). Runtime peer dependencies are the DeepSeek Harness packages at `0.1.0-rc.6` (`@deepseek-ai/cordis`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-credentials`, `@deepseek-ai/dsh-invariants`).
@@ -25,7 +25,8 @@ To use the plugin as a dependency: `npm install @deepseek-ai/dsh-llm-fallback`, 
 - **Task continuation** — a switch mid-tool-loop keeps completed tool results; later steps and turns continue on the switched route.
 - **Probing for unobservable providers** — providers without a quota source degrade to trial-and-error: candidates are attempted in order, and the first success is remembered as session-healthy.
 - **Preemptive quota warnings** — before each request the resolved route's allowance is checked; below a configured threshold it switches without ever sending the failing request, recording `llm/quota-warning`.
-- **Respects a user model switch** — when the user actively switches the session model, its selection is honored (it is not redirected back to the session-healthy fallback) and the new model gets a forced (cache-bypassing) allowance re-check: if under-funded, it warns and switches to a usable fallback.
+- **Respects a user model switch** — when the user actively switches the session model, its selection is honored (it is not redirected back to the session-healthy fallback) and the new model gets a forced (cache-bypassing) allowance re-check: if under-funded, it warns and switches to a usable fallback; if its allowance is **unobservable**, this very request acts as a real usability probe (`llm/quota-warning` reason `unobservable`) and a failure bans it and falls back.
+- **One-shot restore of all models** — an escape hatch: `resetFallback(ctx)` (or the agent-callable `llm-fallback/reset` tool, requiring explicit `confirm: true`) clears every routing decision the plugin made across all configured models — bans, the session-healthy route, cost-risk scores, step-level selection state, and the allowance cache — so the next request re-decides from the user's model selection and fallback chain.
 - **Quota-kind-aware bans** — a recharge `balance` at zero bans permanently, a resetting `quota` bans until `resetAt`, transient failures cool down for `cooldownMs`, and unobservable routes only trial-and-error.
 - **Optional LLM decision** — a pluggable `decisionProvider` receives the primary capability plus the expanded candidate list and may pick any route; a throw, timeout, or invalid route falls back to rule matching.
 
@@ -98,7 +99,7 @@ Quota interrogation resolves in precedence order: `static` (highest), then `prov
 Both events are non-surface and typed by the browser-safe `@deepseek-ai/dsh-llm-fallback/types` subpath, so remote renderers can read durable status without loading the runtime.
 
 - `llm/fallback` — recorded immediately before switching: `{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`. `remaining` counts fallback chain entries at or after the selected route, not guaranteed viable candidates (under strategy/decision selection some may be banned or fail the floor), and it includes the selected route itself unless it was the very last entry.
-- `llm/quota-warning` — recorded when a pre-request check trips a threshold or cost projection: `{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, reason }` with `reason` of `below-threshold` or `insufficient-cost`.
+- `llm/quota-warning` — recorded when a pre-request check trips a threshold or cost projection, or when a user-switched model has an unobservable allowance: `{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, reason }` with `reason` of `below-threshold`, `insufficient-cost`, or `unobservable`.
 
 The separately published `./invariant` companion checks that every record names the current open turn/step, carries non-empty identifiers, non-negative numeric fields, a different from/to route for `llm/fallback`, and a known reason for `llm/quota-warning`.
 

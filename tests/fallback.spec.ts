@@ -109,7 +109,7 @@ async function harness(
   catalog: Record<string, ModelSpec[]> = {},
   retryOptions: { policies?: Record<string, RetryPolicyConfig | undefined>; internals?: retry.RetryInternals } = {},
   beforeFallback?: (ctx: Context) => void,
-): Promise<{ ctx: Context; adapter: ScriptedAdapter; fallbackFiber: ReturnType<Context['plugin']>; stats: () => { agents: number; steps: number } | undefined }> {
+): Promise<{ ctx: Context; adapter: ScriptedAdapter; fallbackFiber: ReturnType<Context['plugin']>; stats: () => { agents: number; steps: number } | undefined; reset: () => fallback.ResetSummary | undefined }> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
@@ -134,7 +134,9 @@ async function harness(
   ctx.llm.registerAdapter(Object.keys(scripts), adapter)
   const stats = (): { agents: number; steps: number } | undefined =>
     innerCtx === undefined ? undefined : fallback.getFallbackStats(innerCtx)
-  return { ctx, adapter, fallbackFiber, stats }
+  const reset = (): fallback.ResetSummary | undefined =>
+    innerCtx === undefined ? undefined : fallback.resetFallback(innerCtx)
+  return { ctx, adapter, fallbackFiber, stats, reset }
 }
 
 describe('llm-fallback (slice 1: fail-and-switch)', () => {
@@ -1275,5 +1277,78 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
     expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
       .toEqual(['ds/chat', 'gl/opus', 'az/pick'])
     expect(agent.session.events.filter(event => event.type === 'llm/fallback')).toHaveLength(1)
+  })
+
+  it('T5.10 a user switch to an unobservable model probes with the request and warns', async () => {
+    const h = await harness(
+      {
+        ds: [textResponse('first-ok')],
+        gl: [textResponse('probe-ok')],
+      },
+      { fallbacks: [{ provider: 'az', model: 'never' }] },
+    )
+    ctx = h.ctx
+    let selected = { provider: 'ds', model: 'chat' }
+    ctx.on('agent/request', async (payload, next) => {
+      const resolved = await next()
+      return payload.turn >= 2
+        ? { ...resolved, provider: selected.provider, model: selected.model }
+        : resolved
+    })
+    const agent = ctx.agentLoop.create(SessionId('user-switch-unobservable'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    selected = { provider: 'gl', model: 'haiku' }
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // gl/haiku has no disclosed quota (unobservable), so the plugin honors the
+    // selection and sends this very request as the probe.
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
+      .toEqual(['ds/chat', 'gl/haiku'])
+    const warnings = agent.session.events.filter(event => event.type === 'llm/quota-warning')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.data).toMatchObject({
+      provider: 'gl',
+      model: 'haiku',
+      reason: 'unobservable',
+    })
+  })
+
+  it('T6.5 resetFallback restores every model to usability by clearing bans/healthy/failures', async () => {
+    const h = await harness(
+      {
+        ds: [new LlmError('quota exhausted', 'QUOTA', { status: 402 }), textResponse('ds-recovered')],
+        gl: [textResponse('gl-opus-ok')],
+      },
+      { fallbacks: [{ provider: 'gl', model: 'opus' }] },
+    )
+    ctx = h.ctx
+    // Simulate installModelSelection re-applying the user's primary every request,
+    // so a per-request switch does not persist the fallback route as the header.
+    ctx.on('agent/request', async (_payload, next) => {
+      const resolved = await next()
+      return { ...resolved, provider: 'ds', model: 'chat' }
+    })
+    const agent = ctx.agentLoop.create(SessionId('reset'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // ds failed (now banned) and gl/opus became the session-healthy route.
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
+      .toEqual(['ds/chat', 'gl/opus'])
+
+    const summary = h.reset()!
+    expect(summary.resetAgents).toBe(1)
+    expect(summary.clearedBans).toBeGreaterThanOrEqual(1)
+    expect(summary.clearedFailures).toBeGreaterThanOrEqual(1)
+
+    // After the reset, a fresh turn with the same primary re-tries ds/chat
+    // instead of being redirected to the (cleared) healthy gl/opus or skipping
+    // the (cleared) banned ds.
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
+      .toEqual(['ds/chat', 'gl/opus', 'ds/chat'])
   })
 })

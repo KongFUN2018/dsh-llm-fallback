@@ -49,7 +49,7 @@ export interface QuotaWarningChatData {
     readonly total?: number;
     readonly threshold?: number;
     readonly estimatedCost?: number;
-    readonly reason: 'below-threshold' | 'insufficient-cost';
+    readonly reason: 'below-threshold' | 'insufficient-cost' | 'unobservable';
     /** Strategy mode that selected the target, when a strategy was active. */
     readonly mode?: 'cost' | 'performance' | 'closest';
 }

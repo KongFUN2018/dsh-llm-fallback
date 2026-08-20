@@ -65,7 +65,7 @@ function validateWarning(
   if (estimatedCost !== undefined && (typeof estimatedCost !== 'number' || estimatedCost < 0)) fail('llm/quota-warning estimatedCost must be non-negative when present')
   if (inputPrice !== undefined && (typeof inputPrice !== 'number' || inputPrice < 0)) fail('llm/quota-warning inputPrice must be non-negative when present')
   if (outputPrice !== undefined && (typeof outputPrice !== 'number' || outputPrice < 0)) fail('llm/quota-warning outputPrice must be non-negative when present')
-  if (reason !== 'below-threshold' && reason !== 'insufficient-cost') fail('llm/quota-warning reason must be a known reason')
+  if (reason !== 'below-threshold' && reason !== 'insufficient-cost' && reason !== 'unobservable') fail('llm/quota-warning reason must be a known reason')
   if (mode !== undefined && mode !== 'cost' && mode !== 'performance' && mode !== 'closest') {
     fail(`llm/quota-warning mode must be ${STRATEGY_MODES} when present`)
   }

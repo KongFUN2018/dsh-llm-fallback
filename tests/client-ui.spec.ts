@@ -151,6 +151,18 @@ describe('quotaWarningNodeDefinition', () => {
     )).toBeNull()
   })
 
+  it('accepts the unobservable-probe reason and projects the route', () => {
+    const event = eventOf('llm/quota-warning', 15, {
+      turn: 2, step: 1, provider: 'gl', model: 'haiku', reason: 'unobservable',
+    })
+    const match = matchOf(event)
+    expect(quotaWarningNodeDefinition.match?.(event))
+      .toEqual({ id: 'llm-quota-warning:15', role: 'start' })
+    const state = quotaWarningNodeDefinition.start(contextOf(undefined, match), match, reader)
+    expect(state).toMatchObject({ route: 'gl/haiku', reason: 'unobservable' })
+    expect(state.remaining).toBeUndefined()
+  })
+
   it('accepts a minimal payload without optional fields', () => {
     const event = eventOf('llm/quota-warning', 13, {
       turn: 2, step: 1, provider: 'az', model: 'gpt', reason: 'insufficient-cost',

@@ -55,6 +55,36 @@ export function getFallbackStats(ctx: Context): FallbackStats | undefined {
   return fallbackStatsRegistry.get(ctx)?.()
 }
 
+/** What a {@link resetFallback} call cleared, for diagnostics and tool output. */
+export interface ResetSummary {
+  /** Number of agent states whose runtime routing state was cleared. */
+  resetAgents: number
+  /** Number of banned-until entries removed. */
+  clearedBans: number
+  /** Number of session failure-risk routes cleared. */
+  clearedFailures: number
+  /** Number of step-level states discarded. */
+  clearedSteps: number
+}
+
+/** Per-apply reset handles, keyed by the plugin context. */
+const resetRegistry = new WeakMap<Context, () => ResetSummary>()
+
+/**
+ * Clear every model-availability decision the plugin has made in one plugin
+ * instance (one `apply` context): banned routes, the session-healthy fallback,
+ * the switched-route set, session failure-risk scores, and all step-level
+ * selection state, plus the allowance cache so the next request re-queries
+ * fresh. This is the escape hatch that restores every configured model to
+ * usability regardless of prior plugin decisions.
+ * @param ctx - the plugin's own apply context.
+ * @returns a summary of what was cleared, or `undefined` when no plugin
+ *   instance is installed on that context.
+ */
+export function resetFallback(ctx: Context): ResetSummary | undefined {
+  return resetRegistry.get(ctx)?.()
+}
+
 /** Failure codes that trigger a switch; transient + exhausted-account codes. */
 export const DEFAULT_FALLBACK_CODES = Object.freeze([
   'QUOTA',
@@ -828,6 +858,78 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
   let totalSteps = 0
   const stats = (): { agents: number; steps: number } => ({ agents: totalAgents, steps: totalSteps })
   fallbackStatsRegistry.set(ctx, stats)
+  // Reset closure: clear every model-availability decision so all configured
+  // models become usable again regardless of prior plugin state.
+  resetRegistry.set(ctx, () => {
+    let clearedBans = 0
+    let clearedFailures = 0
+    let clearedSteps = 0
+    for (const agent of [...knownAgents]) {
+      const agentState = states.get(agent)
+      if (agentState === undefined) continue
+      clearedBans += agentState.bannedUntil.size
+      clearedFailures += agentState.failedRoutes.size
+      clearedSteps += agentState.steps.size
+      agentState.bannedUntil.clear()
+      agentState.failedRoutes.clear()
+      agentState.steps.clear()
+      agentState.healthyRoute = undefined
+      agentState.switchedKeys.clear()
+      totalSteps = 0
+    }
+    // Also drop cached/in-flight allowances so the next request re-interrogates.
+    quotaCache.clear()
+    quotaInFlight.clear()
+    return {
+      resetAgents: knownAgents.size,
+      clearedBans,
+      clearedFailures,
+      clearedSteps,
+    } satisfies ResetSummary
+  })
+
+  // Escape-hatch tool: an agent can restore every configured model's usability
+  // in one call by discarding all of the plugin's routing decisions.
+  const tools = ctx.get('tools') as { register(definition: unknown): () => void } | undefined
+  if (tools !== undefined) {
+    const disposeTool = tools.register({
+      name: 'llm-fallback/reset',
+      description: 'Restore every configured model\'s usability in one call: clear all fallback bans, the session-healthy route, cost-risk scores, and step-level selection state owned by the llm-fallback plugin, so the next request re-decides from the user\'s model selection and fallback chain. Use this as an escape hatch when the plugin\'s routing decisions need to be discarded entirely.',
+      parameters: {
+        type: 'object',
+        properties: {
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true to confirm the reset; require explicit consent to avoid an accidental wipe of routing state.',
+          },
+        },
+        required: ['confirm'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            resetAgents: { type: 'number', description: 'Number of agent states cleared.' },
+            clearedBans: { type: 'number', description: 'Number of banned-until entries removed.' },
+            clearedFailures: { type: 'number', description: 'Number of session failure-risk routes cleared.' },
+            clearedSteps: { type: 'number', description: 'Number of step-level states discarded.' },
+          },
+          required: ['resetAgents', 'clearedBans', 'clearedFailures', 'clearedSteps'],
+        },
+        render: (_args: unknown, value: { resetAgents: number; clearedBans: number; clearedFailures: number; clearedSteps: number }) => [{
+          type: 'text' as const,
+          text: `Reset ${value.resetAgents} agent(s): removed ${value.clearedBans} ban(s), ${value.clearedFailures} failure-risk route(s), ${value.clearedSteps} step state(s).`,
+        }],
+      },
+      execute: async (args: unknown) => {
+        if (args !== null && typeof args === 'object' && (args as { confirm?: unknown }).confirm !== true) {
+          throw new Error('llm-fallback/reset requires confirm: true')
+        }
+        return resetRegistry.get(ctx)?.() ?? { resetAgents: 0, clearedBans: 0, clearedFailures: 0, clearedSteps: 0 }
+      },
+    })
+    ctx.effect(() => disposeTool, 'llm-fallback: reset tool')
+  }
 
   const stateFor = (agent: Agent): AgentState => {
     let state = states.get(agent)
@@ -945,6 +1047,20 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
         state.chainCursor = result.nextCursor
         return withRoute(resolved, result.route)
       }
+    } else if (userSwitched && quotaCheck?.remaining === undefined) {
+      // The user picked a model whose allowance is unobservable (no fresh quota
+      // disclosed). Honor the selection and let this very request act as the
+      // probe: a failure will ban + fall back, and a warning surfaces that the
+      // model was probed with the request itself.
+      agent.session.append('llm/quota-warning', {
+        turn,
+        step,
+        provider: resolved.provider,
+        model: resolved.model,
+        reason: 'unobservable' as const,
+      })
+      state.lastRoute = { provider: resolved.provider, model: resolved.model }
+      return resolved
     }
     state.lastRoute = { provider: resolved.provider, model: resolved.model }
     return resolved

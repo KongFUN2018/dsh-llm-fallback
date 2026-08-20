@@ -18,6 +18,29 @@ interface FallbackStats {
 }
 /** Read a live plugin instance's step-state statistics, if installed. */
 export declare function getFallbackStats(ctx: Context): FallbackStats | undefined;
+/** What a {@link resetFallback} call cleared, for diagnostics and tool output. */
+export interface ResetSummary {
+    /** Number of agent states whose runtime routing state was cleared. */
+    resetAgents: number;
+    /** Number of banned-until entries removed. */
+    clearedBans: number;
+    /** Number of session failure-risk routes cleared. */
+    clearedFailures: number;
+    /** Number of step-level states discarded. */
+    clearedSteps: number;
+}
+/**
+ * Clear every model-availability decision the plugin has made in one plugin
+ * instance (one `apply` context): banned routes, the session-healthy fallback,
+ * the switched-route set, session failure-risk scores, and all step-level
+ * selection state, plus the allowance cache so the next request re-queries
+ * fresh. This is the escape hatch that restores every configured model to
+ * usability regardless of prior plugin decisions.
+ * @param ctx - the plugin's own apply context.
+ * @returns a summary of what was cleared, or `undefined` when no plugin
+ *   instance is installed on that context.
+ */
+export declare function resetFallback(ctx: Context): ResetSummary | undefined;
 /** Failure codes that trigger a switch; transient + exhausted-account codes. */
 export declare const DEFAULT_FALLBACK_CODES: readonly string[];
 /** Structural "candidate unusable" codes: advance the chain without banning. */

@@ -14,6 +14,7 @@ export const zh = {
   'warning.belowThreshold': '额度预警：{route} 剩余 {remaining}（阈值 {threshold}），已提前切换',
   'warning.insufficientCost': '额度预警：{route} 剩余 {remaining}，低于本次请求估算成本，已提前切换',
   'warning.belowThresholdUnknown': '额度预警：{route} 低于阈值，已提前切换',
+  'warning.unobservableProbe': '额度预警：{route} 额度不可观测，将用本次请求探测其可用性',
 } satisfies Record<string, string>
 
 /** The llmFallback namespace key union. */
@@ -29,4 +30,5 @@ export const en = {
   'warning.belowThreshold': 'Quota warning: {route} has {remaining} left (threshold {threshold}) — switched preemptively',
   'warning.insufficientCost': 'Quota warning: {route} has {remaining} left, below the estimated request cost — switched preemptively',
   'warning.belowThresholdUnknown': 'Quota warning: {route} fell below its threshold — switched preemptively',
+  'warning.unobservableProbe': 'Quota warning: {route} has no disclosed allowance — probing usability with this request',
 } satisfies Record<FallbackKey, string>

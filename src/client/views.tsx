@@ -79,15 +79,17 @@ export function FallbackNodeView({ node }: { node: { readonly data: FallbackChat
 export function QuotaWarningNodeView({ node }: { node: { readonly data: QuotaWarningChatData } }) {
   const data = node.data
   const remaining = data.remaining
-  const main = data.reason === 'insufficient-cost' && remaining !== undefined
-    ? fbT('warning.insufficientCost', { route: data.route, remaining: String(remaining) })
-    : remaining !== undefined && data.threshold !== undefined
-      ? fbT('warning.belowThreshold', {
-        route: data.route,
-        remaining: String(remaining),
-        threshold: String(data.threshold),
-      })
-      : fbT('warning.belowThresholdUnknown', { route: data.route })
+  const main = data.reason === 'unobservable'
+    ? fbT('warning.unobservableProbe', { route: data.route })
+    : data.reason === 'insufficient-cost' && remaining !== undefined
+      ? fbT('warning.insufficientCost', { route: data.route, remaining: String(remaining) })
+      : remaining !== undefined && data.threshold !== undefined
+        ? fbT('warning.belowThreshold', {
+          route: data.route,
+          remaining: String(remaining),
+          threshold: String(data.threshold),
+        })
+        : fbT('warning.belowThresholdUnknown', { route: data.route })
   return (
     <div style={rowStyle} data-dsh-llm-fallback="quota-warning">
       <div style={lineStyle}>

@@ -125,8 +125,10 @@ export interface LlmQuotaWarningEventData {
     inputPrice?: number;
     /** Output unit price (per million tokens) used in the estimate. */
     outputPrice?: number;
-    /** Warning reason. */
-    reason: 'below-threshold' | 'insufficient-cost';
+    /** Warning reason: preemptive switch below a threshold / above projected cost,
+     * or an `'unobservable'` note that a user-switched model has no disclosed
+     * allowance and will be probed with the current request (failing bans it). */
+    reason: 'below-threshold' | 'insufficient-cost' | 'unobservable';
     /** Strategy mode that selected the target, when a strategy was active. */
     mode?: StrategyMode;
 }
