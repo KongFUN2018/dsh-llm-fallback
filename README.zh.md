@@ -11,7 +11,7 @@
 ```bash
 npm install
 npm run build   # tsc 产出 lib/types/*.js + .d.ts，再由 tsdown 打包到 lib/
-npm test        # 76 个 vitest 测试
+npm test        # 78 个 vitest 测试
 ```
 
 要求：Node ≥ 24，npm（或 pnpm）。运行时 peer 依赖为 DeepSeek Harness 的 `0.1.0-rc.6` 包（`@deepseek-ai/cordis`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-agent`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-credentials`、`@deepseek-ai/dsh-invariants`）。
@@ -25,6 +25,7 @@ npm test        # 76 个 vitest 测试
 - **任务延续** —— 工具循环中途切换时，已完成的工具结果保留，后续步骤继续在新模型上执行。
 - **不可观测供应商兜底探测** —— 没有额度源的供应商退化为试错：按顺序尝试候选，首个成功者被记为「会话内健康」。
 - **提前预警** —— 每次请求前检查当前路由额度，低于阈值时直接切换（不发失败请求），记录 `llm/quota-warning`。
+- **尊重用户切模型** —— 用户主动切换会话模型时，尊重其选择（不会被改回会话健康回退路由），并对新选模型做一次**强制（跳过缓存）额度复查**：若额度不足则预警并切到可用回退。
 - **按额度形态禁选** —— 充值 `balance` 耗尽即永久禁选；定时 `quota` 禁选至 `resetAt`；瞬时失败按 `cooldownMs` 冷却；不可观测路由只试错。
 - **可选 LLM 决策** —— 可插拔 `decisionProvider` 收到主路由能力与展开后的候选列表，可任选路由；抛错、超时或非法路由自动回退规则匹配。
 

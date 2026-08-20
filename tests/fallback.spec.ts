@@ -1194,4 +1194,86 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
     })
     expect(warnings[0]!.data.estimatedCost).toBeCloseTo(100, 5)
   })
+
+  it('T5.8 a user model switch is re-checked with a fresh allowance and redirects when under-funded', async () => {
+    const h = await harness(
+      {
+        ds: [textResponse('first-ok')],
+        az: [textResponse('fallback-ok')],
+      },
+      {
+        fallbacks: [{ provider: 'az', model: 'model-az' }],
+        quota: {
+          static: {
+            ds: { kind: 'balance', remaining: 100 },
+            gl: { kind: 'balance', remaining: 5 },
+          },
+          thresholdAbsolute: 10,
+          cacheMs: 30_000,
+        },
+      },
+    )
+    ctx = h.ctx
+    // The user switches the session model selection on the second turn.
+    let selected = { provider: 'ds', model: 'chat' }
+    ctx.on('agent/request', async (payload, next) => {
+      const resolved = await next()
+      return payload.turn >= 2
+        ? { ...resolved, provider: selected.provider, model: selected.model }
+        : resolved
+    })
+    const agent = ctx.agentLoop.create(SessionId('user-switch-quota'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    selected = { provider: 'gl', model: 'new-model' }
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // Turn 1 runs ds/chat. Turn 2 the user picked gl/new-model — an under-funded fresh
+    // primary (5 < threshold 10) — so the plugin forces a fresh check and redirects
+    // to the fallback instead of trusting the stale cache or admitting the user model.
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
+      .toEqual(['ds/chat', 'az/model-az'])
+    const warnings = agent.session.events.filter(event => event.type === 'llm/quota-warning')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.data).toMatchObject({
+      provider: 'gl',
+      model: 'new-model',
+      remaining: 5,
+      threshold: 10,
+      reason: 'below-threshold',
+    })
+  })
+
+  it('T5.9 a user model switch respects the user over the session healthy fallback', async () => {
+    const h = await harness(
+      {
+        ds: [new LlmError('quota exhausted', 'QUOTA', { status: 402 })],
+        gl: [textResponse('healthy-ok')],
+        az: [textResponse('user-pick-ok')],
+      },
+      { fallbacks: [{ provider: 'gl', model: 'opus' }] },
+    )
+    ctx = h.ctx
+    let selected = { provider: 'gl', model: 'opus' }
+    ctx.on('agent/request', async (payload, next) => {
+      const resolved = await next()
+      return payload.turn >= 2
+        ? { ...resolved, provider: selected.provider, model: selected.model }
+        : resolved
+    })
+    const agent = ctx.agentLoop.create(SessionId('user-switch-respect'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    selected = { provider: 'az', model: 'pick' }
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // Turn 1: ds fails, the plugin falls back to gl/opus which becomes the session
+    // healthy route. Turn 2: the user picks az/pick — a user switch, so the plugin
+    // must NOT force the request back to gl/opus and instead honor az/pick.
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
+      .toEqual(['ds/chat', 'gl/opus', 'az/pick'])
+    expect(agent.session.events.filter(event => event.type === 'llm/fallback')).toHaveLength(1)
+  })
 })

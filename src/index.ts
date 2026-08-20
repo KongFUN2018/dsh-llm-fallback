@@ -353,12 +353,14 @@ function compareCandidates(
   }
 }
 
-/** Resolve one exact route's capability signals. */
+/** Resolve one exact route's capability signals; a resolve failure degrades to
+ * an empty capability (unknown window/modalities) rather than blocking the
+ * request — consistent with the plugin's "never block" philosophy. */
 async function capabilityOf(ctx: Context, route: Route): Promise<Capability> {
-  const info = await ctx.llm.resolveModelInfo(route.provider, route.model)
+  const info = await ctx.llm.resolveModelInfo(route.provider, route.model).catch(() => undefined)
   return {
-    ...info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
-    ...info.inputModalities === undefined ? {} : { modalities: info.inputModalities },
+    ...info === undefined || info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
+    ...info === undefined || info.inputModalities === undefined ? {} : { modalities: info.inputModalities },
   }
 }
 
@@ -737,13 +739,18 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     const ambient = process.env[ref]
     return ambient !== undefined && ambient.length > 0 ? ambient : undefined
   }
-  const checkQuota = async (provider: string, model: string, signal: AbortSignal): Promise<QuotaCheck | undefined> => {
+  const checkQuota = async (provider: string, model: string, signal: AbortSignal, force = false): Promise<QuotaCheck | undefined> => {
     const staticEntry = quota?.static?.[provider]
     if (staticEntry !== undefined) return staticEntry
-    const cached = quotaCache.get(provider)
-    if (cached !== undefined && Date.now() - cached.at < quotaCacheMs) return cached.check
-    const pending = quotaInFlight.get(provider)
-    if (pending !== undefined) return pending
+    // A forced check (e.g. right after the user switches models) bypasses the
+    // TTL cache and any in-flight dedup so the new route is interrogated fresh;
+    // its result is still written back to the cache for later reads.
+    if (!force) {
+      const cached = quotaCache.get(provider)
+      if (cached !== undefined && Date.now() - cached.at < quotaCacheMs) return cached.check
+      const pending = quotaInFlight.get(provider)
+      if (pending !== undefined) return pending
+    }
     const task = (async (): Promise<QuotaCheck | undefined> => {
       for (const source of quota?.providers ?? []) {
         const result = await source.check(provider, model, signal).catch(() => undefined)
@@ -872,10 +879,17 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     const state = stepFor(agent, turn, step)
     state.attempts += 1
     const resolved = await next()
-    if (state.primary === undefined) {
+    const previousPrimary = agentState.primaryRoute
+    const isFreshPrimary = state.primary === undefined
+    if (isFreshPrimary) {
       state.primary = { provider: resolved.provider, model: resolved.model }
       agentState.primaryRoute = { provider: resolved.provider, model: resolved.model }
     }
+    // A fresh primary that differs from the previous step's is a user-initiated
+    // model switch (the plugin never rewrites primaryRoute to a fallback, so a
+    // change here reflects the user's own selection change).
+    const userSwitched = isFreshPrimary && previousPrimary !== undefined
+      && (previousPrimary.provider !== resolved.provider || previousPrimary.model !== resolved.model)
     knownAgents.add(agent)
     const pending = state.pendingRoute
     state.pendingRoute = undefined
@@ -884,15 +898,20 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       state.lastRoute = { provider: replaced.provider, model: replaced.model }
       return replaced
     }
+    // Respect a user's explicit model switch: don't force the request back to
+    // the session's healthy fallback route — the new model gets its own fresh
+    // quota re-check below instead of silently being overridden.
     const healthy = agentState.healthyRoute
-    if (healthy !== undefined && (healthy.provider !== resolved.provider || healthy.model !== resolved.model)) {
+    if (!userSwitched && healthy !== undefined && (healthy.provider !== resolved.provider || healthy.model !== resolved.model)) {
       const redirected = withRoute(resolved, healthy)
       state.lastRoute = { provider: redirected.provider, model: redirected.model }
       return redirected
     }
     // Preemptive switch when the resolved route's allowance trips a threshold
-    // or cannot cover the projected cost of this request.
-    const quotaCheck = await checkQuota(resolved.provider, resolved.model, signal)
+    // or cannot cover the projected cost of this request. A user-switched model
+    // is interrogated fresh (force=true) to notice an underfunded selection
+    // rather than trusting a stale cached allowance.
+    const quotaCheck = await checkQuota(resolved.provider, resolved.model, signal, userSwitched)
     const trip = quotaCheck === undefined ? { below: false } : belowThreshold(quotaCheck, quota)
     const projected = estimateCost(quota, resolved.provider, resolved.model, agent.session)
     const costTrip = projected !== undefined
