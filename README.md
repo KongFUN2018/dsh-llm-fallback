@@ -11,7 +11,7 @@ This is a standalone repository (not part of the DeepSeek Harness monorepo). It 
 ```bash
 npm install
 npm run build   # tsc emits lib/types/*.js + .d.ts, then tsdown bundles lib/
-npm test        # 42 vitest tests
+npm test        # 76 vitest tests
 ```
 
 Requirements: Node ≥ 24, npm (or pnpm). Runtime peer dependencies are the DeepSeek Harness packages at `0.1.0-rc.6` (`@deepseek-ai/cordis`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-credentials`, `@deepseek-ai/dsh-invariants`).
@@ -47,7 +47,7 @@ Beyond the default lazy chain walk, `strategy` selects the switch target under a
 - **`performance`** — same floor, then the strongest candidate by a lexicographic capability order (`reasoning` → `contextWindow` → `maxTokens`, each deciding only on a significant ratio) so outlier axes cannot hijack the pick.
 - **`closest`** (or no `strategy`) — the legacy lazy chain walk with `preference` tie-breaks.
 
-Both modes share one invariant: **the floor guarantees the switch can finish the task; the score only chooses among candidates that already can** — the cheapest model that cannot carry the context is never selected. When cost-mode candidates keep failing, the **escalation ladder** re-selects that step under `performance` after `afterFailures` (default 2) losses, putting task completion above the cost preference. Switch events carry the active `mode` (and `score` under cost) so the UI can show why a route was chosen.
+Both modes share one invariant: **the floor guarantees the switch can finish the task; the score only chooses among candidates that already can** — the cheapest model that cannot carry the context is never selected. When cost-mode candidates keep failing, the **escalation ladder** re-selects that step under `performance` after `afterFailures` (default 2) losses, putting task completion above the cost preference. Switch events carry the active `mode` (and `score` under cost), and the chat notice rows render that mode tag — plus the projected cost under cost mode — so each switch is explainable right where it happened (see [docs/strategy-design.md §十三](docs/strategy-design.md)).
 
 ## Configuration
 
@@ -96,7 +96,7 @@ Quota interrogation resolves in precedence order: `static` (highest), then `prov
 
 Both events are non-surface and typed by the browser-safe `@deepseek-ai/dsh-llm-fallback/types` subpath, so remote renderers can read durable status without loading the runtime.
 
-- `llm/fallback` — recorded immediately before switching: `{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`.
+- `llm/fallback` — recorded immediately before switching: `{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`. `remaining` counts fallback chain entries at or after the selected route, not guaranteed viable candidates (under strategy/decision selection some may be banned or fail the floor), and it includes the selected route itself unless it was the very last entry.
 - `llm/quota-warning` — recorded when a pre-request check trips a threshold or cost projection: `{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, reason }` with `reason` of `below-threshold` or `insufficient-cost`.
 
 The separately published `./invariant` companion checks that every record names the current open turn/step, carries non-empty identifiers, non-negative numeric fields, a different from/to route for `llm/fallback`, and a known reason for `llm/quota-warning`.

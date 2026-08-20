@@ -8,6 +8,8 @@ export declare const zh: {
     'fallback.prefix': string;
     'fallback.detail': string;
     'fallback.detailLast': string;
+    'strategy.mode': string;
+    'strategy.score': string;
     'warning.belowThreshold': string;
     'warning.insufficientCost': string;
     'warning.belowThresholdUnknown': string;
@@ -19,6 +21,8 @@ export declare const en: {
     'fallback.prefix': string;
     'fallback.detail': string;
     'fallback.detailLast': string;
+    'strategy.mode': string;
+    'strategy.score': string;
     'warning.belowThreshold': string;
     'warning.insufficientCost': string;
     'warning.belowThresholdUnknown': string;

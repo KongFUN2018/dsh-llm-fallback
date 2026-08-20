@@ -28,8 +28,12 @@ export interface FallbackSwitchRow {
     readonly to: string;
     /** Provider-neutral failure code that triggered the switch. */
     readonly code: string;
-    /** Fallback candidates remaining after this switch. */
+    /** Chain positions remaining after this switch (see LlmFallbackEventData). */
     readonly remaining: number;
+    /** Strategy mode that selected the target, when a strategy was active. */
+    readonly mode?: 'cost' | 'performance' | 'closest';
+    /** The mode's score for the selected route (cost mode: projected cost), when defined. */
+    readonly score?: number;
 }
 /** Chat payload of one llm/fallback event. */
 export interface FallbackChatData {
@@ -46,7 +50,17 @@ export interface QuotaWarningChatData {
     readonly threshold?: number;
     readonly estimatedCost?: number;
     readonly reason: 'below-threshold' | 'insufficient-cost';
+    /** Strategy mode that selected the target, when a strategy was active. */
+    readonly mode?: 'cost' | 'performance' | 'closest';
 }
+/** One mode for strategy-detail rendering. */
+export type StrategyModeDisplay = 'cost' | 'performance' | 'closest';
+/**
+ * Translated strategy-detail segments for one switch notice: a mode tag, plus
+ * the projected cost when a cost-mode score is present. Empty for a rule-based
+ * (no-strategy) switch, so the view renders no trailing detail.
+ */
+export declare function strategyDetailParts(mode: StrategyModeDisplay | undefined, score: number | undefined): string[];
 /** Definition for the durable llm/fallback switch notice. */
 export declare const fallbackNodeDefinition: ConversationNodeDefinition<FallbackChatData>;
 /** Definition for the durable llm/quota-warning preemptive-switch notice. */

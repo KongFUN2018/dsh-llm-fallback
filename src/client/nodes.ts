@@ -17,6 +17,7 @@ import type {
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type { LlmFallbackEventData, LlmQuotaWarningEventData } from '../types.ts'
+import { fbT } from './translate.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
   interface ChatNodeDataMap {
@@ -37,8 +38,12 @@ export interface FallbackSwitchRow {
   readonly to: string
   /** Provider-neutral failure code that triggered the switch. */
   readonly code: string
-  /** Fallback candidates remaining after this switch. */
+  /** Chain positions remaining after this switch (see LlmFallbackEventData). */
   readonly remaining: number
+  /** Strategy mode that selected the target, when a strategy was active. */
+  readonly mode?: 'cost' | 'performance' | 'closest'
+  /** The mode's score for the selected route (cost mode: projected cost), when defined. */
+  readonly score?: number
 }
 
 /** Chat payload of one llm/fallback event. */
@@ -57,6 +62,8 @@ export interface QuotaWarningChatData {
   readonly threshold?: number
   readonly estimatedCost?: number
   readonly reason: 'below-threshold' | 'insufficient-cost'
+  /** Strategy mode that selected the target, when a strategy was active. */
+  readonly mode?: 'cost' | 'performance' | 'closest'
 }
 
 /** A finite non-negative integer read from an untrusted payload field. */
@@ -67,6 +74,16 @@ function count(value: unknown): number | undefined {
 /** A non-empty string read from an untrusted payload field. */
 function label(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/** A strategy-mode enum read from an untrusted payload field, or undefined. */
+function strategyMode(value: unknown): 'cost' | 'performance' | 'closest' | undefined {
+  return value === 'cost' || value === 'performance' || value === 'closest' ? value : undefined
+}
+
+/** A finite non-negative score read from an untrusted payload field. */
+function scoreOf(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
 }
 
 /** Structurally narrow one llm/fallback event payload. */
@@ -85,7 +102,13 @@ function fallbackOf(event: SessionEvent): LlmFallbackEventData | undefined {
   if (turn === undefined || step === undefined || fromProvider === undefined
     || fromModel === undefined || toProvider === undefined || toModel === undefined
     || code === undefined || remaining === undefined) return undefined
-  return { turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }
+  const mode = strategyMode(data.mode)
+  const score = scoreOf(data.score)
+  return {
+    turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining,
+    ...(mode !== undefined ? { mode } : {}),
+    ...(score !== undefined ? { score } : {}),
+  }
 }
 
 /** Structurally narrow one llm/quota-warning event payload. */
@@ -107,6 +130,7 @@ function warningOf(event: SessionEvent): LlmQuotaWarningEventData | undefined {
   const estimatedCost = count(data.estimatedCost)
   const inputPrice = count(data.inputPrice)
   const outputPrice = count(data.outputPrice)
+  const mode = strategyMode(data.mode)
   return {
     turn, step, provider, model, reason: data.reason,
     ...(remaining !== undefined ? { remaining } : {}),
@@ -115,12 +139,33 @@ function warningOf(event: SessionEvent): LlmQuotaWarningEventData | undefined {
     ...(estimatedCost !== undefined ? { estimatedCost } : {}),
     ...(inputPrice !== undefined ? { inputPrice } : {}),
     ...(outputPrice !== undefined ? { outputPrice } : {}),
+    ...(mode !== undefined ? { mode } : {}),
   }
 }
 
 /** Best currently loaded event Location of one Context. */
 function contextLocation(context: ConversationNodeContext): ConversationLocation {
   return context.start?.location ?? context.matches[0]?.location ?? { kind: 'unresolved' }
+}
+
+/** One mode for strategy-detail rendering. */
+export type StrategyModeDisplay = 'cost' | 'performance' | 'closest'
+
+/**
+ * Translated strategy-detail segments for one switch notice: a mode tag, plus
+ * the projected cost when a cost-mode score is present. Empty for a rule-based
+ * (no-strategy) switch, so the view renders no trailing detail.
+ */
+export function strategyDetailParts(
+  mode: StrategyModeDisplay | undefined,
+  score: number | undefined,
+): string[] {
+  if (mode === undefined) return []
+  const parts = [fbT('strategy.mode', { mode })]
+  if (mode === 'cost' && score !== undefined) {
+    parts.push(fbT('strategy.score', { score: score.toPrecision(4) }))
+  }
+  return parts
 }
 
 /** Definition for the durable llm/fallback switch notice. */
@@ -142,6 +187,8 @@ export const fallbackNodeDefinition: ConversationNodeDefinition<FallbackChatData
         to: `${payload.toProvider}/${payload.toModel}`,
         code: payload.code,
         remaining: payload.remaining,
+        ...(payload.mode !== undefined ? { mode: payload.mode } : {}),
+        ...(payload.score !== undefined ? { score: payload.score } : {}),
       }],
     }
   },
@@ -183,6 +230,7 @@ export const quotaWarningNodeDefinition: ConversationNodeDefinition<QuotaWarning
       ...(payload.total !== undefined ? { total: payload.total } : {}),
       ...(payload.threshold !== undefined ? { threshold: payload.threshold } : {}),
       ...(payload.estimatedCost !== undefined ? { estimatedCost: payload.estimatedCost } : {}),
+      ...(payload.mode !== undefined ? { mode: payload.mode } : {}),
     }
   },
   update: context => context.state,

@@ -10,7 +10,7 @@ import type {
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import { en, zh } from '../src/client/locales.ts'
 import {
-  fallbackNodeDefinition, quotaWarningNodeDefinition,
+  fallbackNodeDefinition, quotaWarningNodeDefinition, strategyDetailParts,
 } from '../src/client/nodes.ts'
 import { bindFallbackTranslate, fbT } from '../src/client/translate.ts'
 
@@ -23,6 +23,14 @@ const FALLBACK_DATA = {
   toModel: 'haiku',
   code: 'QUOTA',
   remaining: 2,
+  mode: 'cost',
+  score: 0.0005096,
+}
+
+const FALLBACK_DATA_NO_STRATEGY = {
+  ...FALLBACK_DATA,
+  mode: undefined,
+  score: undefined,
 }
 
 const WARNING_DATA = {
@@ -34,6 +42,7 @@ const WARNING_DATA = {
   total: 60,
   threshold: 20,
   reason: 'below-threshold',
+  mode: 'cost',
 }
 
 function eventOf(type: string, seq: number, data: unknown): SessionEvent {
@@ -73,7 +82,7 @@ describe('fallbackNodeDefinition', () => {
     expect(fallbackNodeDefinition.match?.(eventOf('turn/start', 7, {}))).toBeNull()
   })
 
-  it('start projects one switch row with provider/model routes', () => {
+  it('start projects one switch row with routes, mode, and cost score', () => {
     const event = eventOf('llm/fallback', 7, FALLBACK_DATA)
     const match = matchOf(event)
     const state = fallbackNodeDefinition.start(contextOf(undefined, match), match, reader)
@@ -84,7 +93,19 @@ describe('fallbackNodeDefinition', () => {
       to: 'gl/haiku',
       code: 'QUOTA',
       remaining: 2,
+      mode: 'cost',
+      score: 0.0005096,
     }])
+  })
+
+  it('start omits mode and score for a rule-based (no-strategy) switch', () => {
+    const match = matchOf(eventOf('llm/fallback', 8, FALLBACK_DATA_NO_STRATEGY))
+    const state = fallbackNodeDefinition.start(contextOf(undefined, match), match, reader)
+    expect(state.switches[0]).toMatchObject({
+      from: 'ds/chat', to: 'gl/haiku', code: 'QUOTA', remaining: 2,
+    })
+    expect('mode' in state.switches[0]!).toBe(false)
+    expect('score' in state.switches[0]!).toBe(false)
   })
 
   it('start throws on a structurally invalid payload', () => {
@@ -120,6 +141,7 @@ describe('quotaWarningNodeDefinition', () => {
       remaining: 10,
       threshold: 20,
       reason: 'below-threshold',
+      mode: 'cost',
     })
   })
 
@@ -150,6 +172,30 @@ describe('quotaWarningNodeDefinition', () => {
       anchorSeq: 14,
       visibility: 'visible',
     })
+  })
+})
+
+describe('strategyDetailParts', () => {
+  it('renders nothing for a rule-based switch', () => {
+    expect(strategyDetailParts(undefined, undefined)).toEqual([])
+  })
+
+  it('renders a mode tag and the cost score for a cost-mode switch', () => {
+    bindFallbackTranslate((key, params) => `${key}-${JSON.stringify(params ?? {})}`)
+    const parts = strategyDetailParts('cost', 0.0005096)
+    expect(parts).toHaveLength(2)
+    expect(parts[0]).toBe('strategy.mode-{"mode":"cost"}')
+    expect(parts[1]).toBe('strategy.score-{"score":"0.0005096"}')
+  })
+
+  it('renders only the mode tag for performance mode (no score)', () => {
+    bindFallbackTranslate(() => undefined as unknown as string)
+    expect(strategyDetailParts('performance', undefined)).toEqual(['strategy.mode'])
+  })
+
+  it('renders only the mode tag for a cost switch without a score', () => {
+    bindFallbackTranslate(() => undefined as unknown as string)
+    expect(strategyDetailParts('cost', undefined)).toEqual(['strategy.mode'])
   })
 })
 

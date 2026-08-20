@@ -11,7 +11,7 @@
 ```bash
 npm install
 npm run build   # tsc 产出 lib/types/*.js + .d.ts，再由 tsdown 打包到 lib/
-npm test        # 42 个 vitest 测试
+npm test        # 76 个 vitest 测试
 ```
 
 要求：Node ≥ 24，npm（或 pnpm）。运行时 peer 依赖为 DeepSeek Harness 的 `0.1.0-rc.6` 包（`@deepseek-ai/cordis`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-agent`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-credentials`、`@deepseek-ai/dsh-invariants`）。
@@ -47,7 +47,7 @@ npm test        # 42 个 vitest 测试
 - **`performance`（性能）** —— 同一地板，按能力词典序（`reasoning` → `contextWindow` → `maxTokens`，每轴仅在显著比值下分胜负）选最强者，离群轴无法劫持选择。
 - **`closest`（或不配 `strategy`）** —— 原惰性链遍历 + `preference` 平局偏好。
 
-两模式共享一条不变式：**地板保证切换能完成任务，评分只在能完成者中选择**——撑不起上下文的最便宜模型永远不会被选中。性价比模式候选连续失败时，**升级阶梯**在 `afterFailures`（默认 2）次后以性能模式重新选择该步，任务完成优先于成本偏好。切换事件携带生效的 `mode`（性价比模式还有 `score`），界面可解释每次选择的原因。
+两模式共享一条不变式：**地板保证切换能完成任务，评分只在能完成者中选择**——撑不起上下文的最便宜模型永远不会被选中。性价比模式候选连续失败时，**升级阶梯**在 `afterFailures`（默认 2）次后以性能模式重新选择该步，任务完成优先于成本偏好。切换事件携带生效的 `mode`（性价比模式还有 `score`），且会话提示行会渲染该模式标签——性价比模式还带预估成本——于是每次切换都能在发生处直接解释（见 [docs/strategy-design.md §十三](docs/strategy-design.md)）。
 
 ## 配置
 
@@ -96,7 +96,7 @@ npm test        # 42 个 vitest 测试
 
 两类事件均为非表面事件，类型定义在浏览器安全的 `@deepseek-ai/dsh-llm-fallback/types` 子路径中，远程渲染端无需加载运行时即可读取持久状态。
 
-- `llm/fallback` —— 切换前记录：`{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`。
+- `llm/fallback` —— 切换前记录：`{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`。`remaining` 数的是选中路由所在及之后的**链上位置数**，而非"确定可用的候选数"（策略/LLM 决策选择下，部分位置可能已被禁选或不满足地板）；且除非所选路由就是最后一条，否则它计入本次的 `remaining`。
 - `llm/quota-warning` —— 请求前检查触发阈值或消耗预估时记录：`{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, reason }`，`reason` 为 `below-threshold` 或 `insufficient-cost`。
 
 单独发布的 `./invariant` 伴随件校验每条记录都指向当前打开的 turn/step、标识非空、数值字段非负、`llm/fallback` 的 from/to 不同路由、`llm/quota-warning` 的 reason 合法。

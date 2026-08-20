@@ -10,6 +10,7 @@
  */
 import type { CSSProperties } from 'react'
 import type { FallbackChatData, QuotaWarningChatData } from './nodes.ts'
+import { strategyDetailParts } from './nodes.ts'
 import { fbT } from './translate.ts'
 
 const rowStyle: CSSProperties = {
@@ -42,6 +43,13 @@ const routeStyle: CSSProperties = {
   fontSize: '11.5px',
 }
 
+/** Render a strategy-mode tag and (cost) score as a muted segment, or nothing. */
+function strategyDetail(mode: 'cost' | 'performance' | 'closest' | undefined, score: number | undefined) {
+  const parts = strategyDetailParts(mode, score)
+  if (parts.length === 0) return null
+  return <span style={detailStyle}> · {parts.join(' · ')}</span>
+}
+
 /** Keyed chat renderer for one llm/fallback switch notice. */
 export function FallbackNodeView({ node }: { node: { readonly data: FallbackChatData } }) {
   return (
@@ -60,6 +68,7 @@ export function FallbackNodeView({ node }: { node: { readonly data: FallbackChat
               ? fbT('fallback.detail', { code: switched.code, count: switched.remaining })
               : fbT('fallback.detailLast', { code: switched.code })}
           </span>
+          {strategyDetail(switched.mode, switched.score)}
         </div>
       ))}
     </div>
@@ -84,6 +93,7 @@ export function QuotaWarningNodeView({ node }: { node: { readonly data: QuotaWar
       <div style={lineStyle}>
         <span style={iconStyle} aria-hidden>⚠</span>
         <span>{main}</span>
+        {strategyDetail(data.mode, undefined)}
       </div>
     </div>
   )
