@@ -7,6 +7,8 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEventMap } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import CommandRuntime from '@deepseek-ai/dsh-commands'
+import type { CommandExecution } from '@deepseek-ai/dsh-commands'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import * as fallback from '../src/index.ts'
@@ -109,12 +111,13 @@ async function harness(
   catalog: Record<string, ModelSpec[]> = {},
   retryOptions: { policies?: Record<string, RetryPolicyConfig | undefined>; internals?: retry.RetryInternals } = {},
   beforeFallback?: (ctx: Context) => void,
-): Promise<{ ctx: Context; adapter: ScriptedAdapter; fallbackFiber: ReturnType<Context['plugin']>; stats: () => { agents: number; steps: number } | undefined; reset: () => fallback.ResetSummary | undefined }> {
+): Promise<{ ctx: Context; adapter: ScriptedAdapter; fallbackFiber: ReturnType<Context['plugin']>; stats: () => { agents: number; steps: number } | undefined; reset: () => fallback.ResetSummary | undefined; runCommand: (agent: Parameters<CommandRuntime['execute']>[0], line: string) => Promise<CommandExecution | undefined> }> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(CommandRuntime)
   await ctx.plugin(AgentRegistry)
   beforeFallback?.(ctx)
   let innerCtx: Context | undefined
@@ -136,7 +139,9 @@ async function harness(
     innerCtx === undefined ? undefined : fallback.getFallbackStats(innerCtx)
   const reset = (): fallback.ResetSummary | undefined =>
     innerCtx === undefined ? undefined : fallback.resetFallback(innerCtx)
-  return { ctx, adapter, fallbackFiber, stats, reset }
+  const runCommand = async (agent: NonNullable<Parameters<CommandRuntime['execute']>[0]>, line: string):
+    Promise<CommandExecution | undefined> => ctx.commands.execute(agent, line, new AbortController().signal)
+  return { ctx, adapter, fallbackFiber, stats, reset, runCommand }
 }
 
 describe('llm-fallback (slice 1: fail-and-switch)', () => {
@@ -1346,6 +1351,40 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
     // After the reset, a fresh turn with the same primary re-tries ds/chat
     // instead of being redirected to the (cleared) healthy gl/opus or skipping
     // the (cleared) banned ds.
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
+      .toEqual(['ds/chat', 'gl/opus', 'ds/chat'])
+  })
+
+  it('T6.6 the /llm-fallback-reset command restores models through the same registry', async () => {
+    const h = await harness(
+      {
+        ds: [new LlmError('quota exhausted', 'QUOTA', { status: 402 }), textResponse('ds-recovered')],
+        gl: [textResponse('gl-opus-ok')],
+      },
+      { fallbacks: [{ provider: 'gl', model: 'opus' }] },
+    )
+    ctx = h.ctx
+    // Re-apply the user's primary every request (simulate installModelSelection).
+    ctx.on('agent/request', async (_payload, next) => {
+      const resolved = await next()
+      return { ...resolved, provider: 'ds', model: 'chat' }
+    })
+    const agent = ctx.agentLoop.create(SessionId('reset-command'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // ds banned + gl/opus became healthy (same preconditions as the tool test).
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
+      .toEqual(['ds/chat', 'gl/opus'])
+
+    // The command is the production surface the status-bar button calls.
+    const execution = await h.runCommand(agent, '/llm-fallback-reset')
+    expect(execution).toBeDefined()
+    expect(execution!.result.kind).toBe('success')
+
+    // After the command, a fresh turn re-tries the (now unbanned, unredirected) ds/chat.
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
     await agent.whenIdle()
     expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))

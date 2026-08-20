@@ -18,7 +18,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
         llmFallback: FallbackKey;
     }
 }
-/** Required services: the event registry, the slot registry, and locale. */
+/** Required services: the event registry, the slot registry, locale, and sessions. */
 export declare const inject: string[];
 /**
  * Mount the browser half: dictionaries, the two Conversation Definitions, and

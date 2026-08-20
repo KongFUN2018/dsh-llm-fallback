@@ -215,6 +215,13 @@ describe('locales', () => {
   it('keeps en and zh in exact key parity', () => {
     expect(Object.keys(en).sort()).toEqual(Object.keys(zh).sort())
   })
+
+  it('carries the reset-button copy in both dictionaries', () => {
+    expect(zh['reset.label']).toBeTruthy()
+    expect(zh['reset.title']).toBeTruthy()
+    expect(en['reset.label']).toBeTruthy()
+    expect(en['reset.title']).toBeTruthy()
+  })
 })
 
 describe('fbT', () => {

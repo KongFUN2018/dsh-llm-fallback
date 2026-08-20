@@ -11,7 +11,7 @@ This is a standalone repository (not part of the DeepSeek Harness monorepo). It 
 ```bash
 npm install
 npm run build   # tsc emits lib/types/*.js + .d.ts, then tsdown bundles lib/
-npm test        # 81 vitest tests
+npm test        # 83 vitest tests
 ```
 
 Requirements: Node ≥ 24, npm (or pnpm). Runtime peer dependencies are the DeepSeek Harness packages at `0.1.0-rc.6` (`@deepseek-ai/cordis`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-credentials`, `@deepseek-ai/dsh-invariants`).
@@ -26,7 +26,7 @@ To use the plugin as a dependency: `npm install @deepseek-ai/dsh-llm-fallback`, 
 - **Probing for unobservable providers** — providers without a quota source degrade to trial-and-error: candidates are attempted in order, and the first success is remembered as session-healthy.
 - **Preemptive quota warnings** — before each request the resolved route's allowance is checked; below a configured threshold it switches without ever sending the failing request, recording `llm/quota-warning`.
 - **Respects a user model switch** — when the user actively switches the session model, its selection is honored (it is not redirected back to the session-healthy fallback) and the new model gets a forced (cache-bypassing) allowance re-check: if under-funded, it warns and switches to a usable fallback; if its allowance is **unobservable**, this very request acts as a real usability probe (`llm/quota-warning` reason `unobservable`) and a failure bans it and falls back.
-- **One-shot restore of all models** — an escape hatch: `resetFallback(ctx)` (or the agent-callable `llm-fallback/reset` tool, requiring explicit `confirm: true`) clears every routing decision the plugin made across all configured models — bans, the session-healthy route, cost-risk scores, step-level selection state, and the allowance cache — so the next request re-decides from the user's model selection and fallback chain.
+- **One-shot restore of all models** — an escape hatch: `resetFallback(ctx)` (or the agent-callable `llm-fallback/reset` tool, requiring explicit `confirm: true`) clears every routing decision the plugin made across all configured models — bans, the session-healthy route, cost-risk scores, step-level selection state, and the allowance cache — so the next request re-decides from the user's model selection and fallback chain. A subtle status-line-style button in the composer tool row (secondary text that only highlights on hover) issues the same reset through the `/llm-fallback-reset` command.
 - **Quota-kind-aware bans** — a recharge `balance` at zero bans permanently, a resetting `quota` bans until `resetAt`, transient failures cool down for `cooldownMs`, and unobservable routes only trial-and-error.
 - **Optional LLM decision** — a pluggable `decisionProvider` receives the primary capability plus the expanded candidate list and may pick any route; a throw, timeout, or invalid route falls back to rule matching.
 

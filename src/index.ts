@@ -13,6 +13,7 @@ import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { LlmCallConfig, ModelModality } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { DecisionCandidateInfo, DecisionInput, DecisionProvider, LlmFallbackRoute, QuotaCheck, QuotaProvider, QuotaStaticEntry, SelectionPreference, StrategyConfig, StrategyMode } from './types.ts'
 import type { PriceTable, StrategyCandidate, StrategySettings } from './strategy.ts'
 import { priceOf, selectByStrategy } from './strategy.ts'
@@ -929,6 +930,24 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       },
     })
     ctx.effect(() => disposeTool, 'llm-fallback: reset tool')
+  }
+
+  // Mouse-independent escape hatch: a `/llm-fallback:reset` command any
+  // surface (the status-bar button) can invoke via `session.command(...)`.
+  // The handler clears every route decision for the whole plugin instance and
+  // reports a plain summary text; registration is optional so the plugin
+  // keeps working even when the commands registry is not mounted.
+  const commands = ctx.get('commands')
+  if (commands !== undefined) {
+    const disposeCommand = commands.register({
+      name: 'llm-fallback-reset',
+      description: 'Restore every configured model\'s usability \u2014 clear all fallback bans, the session-healthy route, risk scores, and step state.',
+      handler: (): CommandResult => {
+        const summary = resetRegistry.get(ctx)?.() ?? { resetAgents: 0, clearedBans: 0, clearedFailures: 0, clearedSteps: 0 }
+        return { kind: 'success', text: `Restored ${summary.resetAgents} agent(s): cleared ${summary.clearedBans} ban(s), ${summary.clearedFailures} risk route(s), ${summary.clearedSteps} step state(s).` }
+      },
+    })
+    ctx.effect(() => disposeCommand, 'llm-fallback: reset command')
   }
 
   const stateFor = (agent: Agent): AgentState => {
