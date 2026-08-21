@@ -8,7 +8,7 @@
  * ellipsis while the command is in flight), so it reads as a quiet status-bound
  * control rather than a prominent button.
  *
- * @module @deepseek-ai/dsh-llm-fallback/client/resetButton
+ * @module @kongfun2018/dsh-llm-fallback/client/resetButton
  */
 import { useCallback, useState } from 'react'
 import type { CSSProperties } from 'react'

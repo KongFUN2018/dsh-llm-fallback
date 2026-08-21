@@ -6,7 +6,7 @@
  * theme class names; the muted grays sit acceptably on both light and dark
  * themes.
  *
- * @module @deepseek-ai/dsh-llm-fallback/client/views
+ * @module @kongfun2018/dsh-llm-fallback/client/views
  */
 import type { CSSProperties } from 'react'
 import type { FallbackChatData, QuotaWarningChatData } from './nodes.ts'

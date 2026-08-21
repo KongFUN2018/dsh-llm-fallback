@@ -1,11 +1,11 @@
-/** Package-owned durable fallback-event invariants. @module @deepseek-ai/dsh-llm-fallback/invariant */
+/** Package-owned durable fallback-event invariants. @module @kongfun2018/dsh-llm-fallback/invariant */
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { InvariantFailure, InvariantInstaller } from '@deepseek-ai/dsh-invariants'
 import type {} from './index.ts'
 
-const PACKAGE_NAME = '@deepseek-ai/dsh-llm-fallback'
+const PACKAGE_NAME = '@kongfun2018/dsh-llm-fallback'
 
 /** The strategy-mode vocabulary shared by both switch events. */
 const STRATEGY_MODES = "'cost' | 'performance' | 'closest'"

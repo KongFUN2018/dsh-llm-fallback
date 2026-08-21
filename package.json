@@ -1,5 +1,5 @@
 {
-  "name": "@deepseek-ai/dsh-llm-fallback",
+  "name": "@kongfun2018/dsh-llm-fallback",
   "description": "Automatic cross-provider model fallback with quota awareness for the DeepSeek Harness",
   "repository": {
     "type": "git",

@@ -7,7 +7,7 @@
  * locale at call time); components are intentionally not memoized, so any
  * parent re-render — including a locale switch — re-reads current copy.
  *
- * @module @deepseek-ai/dsh-llm-fallback/client/translate
+ * @module @kongfun2018/dsh-llm-fallback/client/translate
  */
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 

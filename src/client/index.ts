@@ -8,7 +8,7 @@
  * Loaded automatically by the DSH web shell through this package's `dsh.client`
  * declaration whenever the node half is loaded in the deployment tree.
  *
- * @module @deepseek-ai/dsh-llm-fallback/client
+ * @module @kongfun2018/dsh-llm-fallback/client
  */
 import type { Context } from '@deepseek-ai/cordis'
 // Type-only: the ctx.locale Context merge.

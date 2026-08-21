@@ -7,7 +7,7 @@
  * renders one preemptive-switch row, anchored at the event's own seq so the
  * notice sits exactly where the switch happened inside the turn.
  *
- * @module @deepseek-ai/dsh-llm-fallback/client/nodes
+ * @module @kongfun2018/dsh-llm-fallback/client/nodes
  */
 import type { ConversationNodeDefinition } from '@deepseek-ai/dsh-client-runtime/client';
 declare module '@deepseek-ai/dsh-client-ui-conversation/client' {

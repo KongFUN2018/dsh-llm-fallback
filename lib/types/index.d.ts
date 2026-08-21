@@ -2,7 +2,7 @@
  * Automatic cross-provider model fallback on the agent loop's request
  * recovery and request-routing extension points.
  *
- * @module @deepseek-ai/dsh-llm-fallback
+ * @module @kongfun2018/dsh-llm-fallback
  */
 import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';

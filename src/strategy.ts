@@ -12,7 +12,7 @@
  * Everything here is pure and synchronous; the host half owns expansion,
  * quota interrogation, and session-memory side effects.
  *
- * @module @deepseek-ai/dsh-llm-fallback/strategy
+ * @module @kongfun2018/dsh-llm-fallback/strategy
  */
 import type { ModelModality } from '@deepseek-ai/dsh-llm'
 import type { StrategyAxis, StrategyMode } from './types.ts'

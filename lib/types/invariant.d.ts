@@ -1,4 +1,4 @@
-/** Package-owned durable fallback-event invariants. @module @deepseek-ai/dsh-llm-fallback/invariant */
+/** Package-owned durable fallback-event invariants. @module @kongfun2018/dsh-llm-fallback/invariant */
 import type { Context } from '@deepseek-ai/cordis';
 /** Cordis companion plugin name. */
 export declare const name = "llm-fallback-invariant";

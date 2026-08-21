@@ -1,4 +1,4 @@
-# `@deepseek-ai/dsh-llm-fallback`
+# `@kongfun2018/dsh-llm-fallback`
 
 English | [中文](README.zh.md)
 
@@ -16,7 +16,7 @@ npm test        # 83 vitest tests
 
 Requirements: Node ≥ 24, npm (or pnpm). Runtime peer dependencies are the DeepSeek Harness packages at `0.1.0-rc.6` (`@deepseek-ai/cordis`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-credentials`, `@deepseek-ai/dsh-invariants`).
 
-To use the plugin as a dependency: `npm install @deepseek-ai/dsh-llm-fallback`, then register it in your DSH config (see [Configuration](#configuration)).
+To use the plugin as a dependency: `npm install @kongfun2018/dsh-llm-fallback`, then register it in your DSH config (see [Configuration](#configuration)).
 
 ## What it does
 
@@ -39,7 +39,7 @@ The package ships a browser companion (declared through its `dsh.client` field) 
 
 The composer's model seat deliberately keeps showing your own selection: selection is intent, routing is the plugin's job. The actual model behind each reply remains visible per message in the Trajectory view's provenance, and these rows mark every switch inline.
 
-To deploy: install this package into your DSH deployment tree (the directory holding your `cordis.yml`) — `npm install @deepseek-ai/dsh-llm-fallback` — and register the node half in the config. `dsh web` then serves the browser half at `/plugins/@deepseek-ai/dsh-llm-fallback/client.js` and injects it into the boot manifest; no extra wiring.
+To deploy: install this package into your DSH deployment tree (the directory holding your `cordis.yml`) — `npm install @kongfun2018/dsh-llm-fallback` — and register the node half in the config. `dsh web` then serves the browser half at `/plugins/@kongfun2018/dsh-llm-fallback/client.js` and injects it into the boot manifest; no extra wiring.
 
 ## Switching strategy modes
 
@@ -56,7 +56,7 @@ Both modes share one invariant: **the floor guarantees the switch can finish the
 ```yaml
 - name: '@deepseek-ai/dsh-llm-deepseek'
 
-- name: '@deepseek-ai/dsh-llm-fallback'
+- name: '@kongfun2018/dsh-llm-fallback'
   config:
     fallbacks:
       - provider: gl
@@ -96,7 +96,7 @@ Quota interrogation resolves in precedence order: `static` (highest), then `prov
 
 ## Events
 
-Both events are non-surface and typed by the browser-safe `@deepseek-ai/dsh-llm-fallback/types` subpath, so remote renderers can read durable status without loading the runtime.
+Both events are non-surface and typed by the browser-safe `@kongfun2018/dsh-llm-fallback/types` subpath, so remote renderers can read durable status without loading the runtime.
 
 - `llm/fallback` — recorded immediately before switching: `{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`. `remaining` counts fallback chain entries at or after the selected route, not guaranteed viable candidates (under strategy/decision selection some may be banned or fail the floor), and it includes the selected route itself unless it was the very last entry.
 - `llm/quota-warning` — recorded when a pre-request check trips a threshold or cost projection, or when a user-switched model has an unobservable allowance: `{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, reason }` with `reason` of `below-threshold`, `insufficient-cost`, or `unobservable`.

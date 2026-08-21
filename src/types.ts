@@ -2,7 +2,7 @@
  * Browser-safe types for the llm-fallback plugin: the durable fallback event
  * vocabulary plus the ordered fallback route description.
  *
- * @module @deepseek-ai/dsh-llm-fallback/types
+ * @module @kongfun2018/dsh-llm-fallback/types
  */
 
 /** Rule-based tie-break preference among capability-matched candidates. */

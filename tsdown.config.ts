@@ -63,7 +63,7 @@ export default defineConfig([
     external: [...CLIENT_EXTERNALS],
     outputOptions: {
       entryFileNames: 'client.js',
-      banner: "window.__ModuleLoader__.load({ id: '@deepseek-ai/dsh-llm-fallback', factory: (require) => {",
+      banner: "window.__ModuleLoader__.load({ id: '@kongfun2018/dsh-llm-fallback', factory: (require) => {",
       footer: 'return module.exports; } });',
       intro: 'var module = { exports: {} }; var exports = module.exports;',
     },

@@ -1,4 +1,4 @@
-# `@deepseek-ai/dsh-llm-fallback`
+# `@kongfun2018/dsh-llm-fallback`
 
 [English](README.md) | 中文
 
@@ -16,7 +16,7 @@ npm test        # 83 个 vitest 测试
 
 要求：Node ≥ 24，npm（或 pnpm）。运行时 peer 依赖为 DeepSeek Harness 的 `0.1.0-rc.6` 包（`@deepseek-ai/cordis`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-agent`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-credentials`、`@deepseek-ai/dsh-invariants`）。
 
-作为依赖安装：`npm install @deepseek-ai/dsh-llm-fallback`，然后在 DSH 配置里注册（见[配置](#配置)）。
+作为依赖安装：`npm install @kongfun2018/dsh-llm-fallback`，然后在 DSH 配置里注册（见[配置](#配置)）。
 
 ## 功能
 
@@ -39,7 +39,7 @@ npm test        # 83 个 vitest 测试
 
 输入框的模型座位刻意继续显示你自己的选择：选择表达意图，路由由插件负责。每条回复实际使用的模型仍可在 Trajectory 视图的 provenance 中逐条查看，而这些提示行在会话内标记每一次切换。
 
-部署方式：把本包安装进 DSH 部署树（即存放 `cordis.yml` 的目录）—— `npm install @deepseek-ai/dsh-llm-fallback` —— 并在配置中注册节点端。`dsh web` 会自动把浏览器端以 `/plugins/@deepseek-ai/dsh-llm-fallback/client.js` 提供并注入 boot manifest，无需额外接线。
+部署方式：把本包安装进 DSH 部署树（即存放 `cordis.yml` 的目录）—— `npm install @kongfun2018/dsh-llm-fallback` —— 并在配置中注册节点端。`dsh web` 会自动把浏览器端以 `/plugins/@kongfun2018/dsh-llm-fallback/client.js` 提供并注入 boot manifest，无需额外接线。
 
 ## 切换策略模式
 
@@ -56,7 +56,7 @@ npm test        # 83 个 vitest 测试
 ```yaml
 - name: '@deepseek-ai/dsh-llm-deepseek'
 
-- name: '@deepseek-ai/dsh-llm-fallback'
+- name: '@kongfun2018/dsh-llm-fallback'
   config:
     fallbacks:
       - provider: gl
@@ -96,7 +96,7 @@ npm test        # 83 个 vitest 测试
 
 ## 事件
 
-两类事件均为非表面事件，类型定义在浏览器安全的 `@deepseek-ai/dsh-llm-fallback/types` 子路径中，远程渲染端无需加载运行时即可读取持久状态。
+两类事件均为非表面事件，类型定义在浏览器安全的 `@kongfun2018/dsh-llm-fallback/types` 子路径中，远程渲染端无需加载运行时即可读取持久状态。
 
 - `llm/fallback` —— 切换前记录：`{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`。`remaining` 数的是选中路由所在及之后的**链上位置数**，而非"确定可用的候选数"（策略/LLM 决策选择下，部分位置可能已被禁选或不满足地板）；且除非所选路由就是最后一条，否则它计入本次的 `remaining`。
 - `llm/quota-warning` —— 请求前检查触发阈值、消耗预估，或用户切换模型后额度不可观测时记录：`{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, reason }`，`reason` 为 `below-threshold`、`insufficient-cost` 或 `unobservable`。
