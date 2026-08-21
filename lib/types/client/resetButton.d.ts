@@ -10,9 +10,9 @@ export interface ResetButtonProps extends ResetButtonInjected {
     t: TranslateNS<'llmFallback'>;
 }
 /**
- * The reset button. It dispatches `runReset` on click and toggles between a
- * muted idle look and a hover-highlighted look, both derived from theme alias
- * tokens so the control adapts to the active theme without owning CSS.
+ * The reset button. Dispatches `runReset` on click and toggles between a muted
+ * idle look and a hover-highlighted look, both derived from theme alias tokens.
+ * While the command is in flight it renders a busy spinner glyph.
  * @param props - injected face plus the locale seat.
  */
 export declare function ResetButton(props: ResetButtonProps): React.ReactElement;
