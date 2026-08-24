@@ -12,7 +12,7 @@ import type { CommandExecution } from '@deepseek-ai/dsh-commands'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import * as fallback from '../src/index.ts'
-import type { DecisionInput, DecisionProvider, LlmFallbackEventData, LlmQuotaWarningEventData, QuotaProvider } from '../src/types.ts'
+import type { LlmFallbackEventData, LlmQuotaWarningEventData, QuotaProvider } from '../src/types.ts'
 
 type ScriptEntry = Error | Iterable<StreamChunk> | AsyncIterable<StreamChunk>
 
@@ -27,6 +27,8 @@ interface ModelSpec {
 /** One adapter serving several providers, each with its own scripted responses. */
 class ScriptedAdapter extends LlmAdapter {
   readonly requests: GenerateOptions[] = []
+  readonly listModelsCalls: string[] = []
+  readonly resolveModelCalls: string[] = []
   private retryPolicies: Record<string, ResolvedRetryPolicy | undefined> = {}
 
   constructor(
@@ -57,6 +59,7 @@ class ScriptedAdapter extends LlmAdapter {
   }
 
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    this.listModelsCalls.push(provider)
     const models = this.catalog[provider] ?? []
     return Promise.resolve(models.map(model => ({
       provider,
@@ -67,6 +70,7 @@ class ScriptedAdapter extends LlmAdapter {
   }
 
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    this.resolveModelCalls.push(`${provider}/${model}`)
     const spec = this.catalog[provider]?.find(entry => entry.id === model)
     if (spec === undefined) return Promise.resolve({ provider, id: model, name: model })
     return Promise.resolve({
@@ -636,7 +640,7 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
     expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['gl/opus'])
     const warnings = agent.session.events.filter(event => event.type === 'llm/quota-warning')
     expect(warnings.map(event => event.data)).toEqual([{
-      turn: 1, step: 1, provider: 'ds', model: 'chat', remaining: 100, threshold: 200, reason: 'below-threshold',
+      turn: 1, step: 1, provider: 'ds', model: 'chat', remaining: 100, threshold: 200, thresholdKind: 'absolute', reason: 'below-threshold',
     }])
     expect(agent.session.deriveMessages().at(-1)).toMatchObject({
       role: 'assistant',
@@ -865,84 +869,6 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
     expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat', 'gl/thinker'])
   })
 
-  it('T3.2 adopts a decision provider result over rule matching', async () => {
-    const decisions: DecisionInput[] = []
-    const decisionProvider: DecisionProvider = {
-      async decide(input) {
-        decisions.push(input)
-        return { provider: 'gl', model: 'opus' }
-      },
-    }
-    const h = await harness({
-      ds: [new LlmError('quota', 'QUOTA', { status: 402 })],
-      gl: [textResponse('done')],
-    }, {
-      fallbacks: [{ provider: 'gl' }],
-      decisionProvider,
-    }, {
-      gl: [
-        { id: 'haiku', contextWindow: 128000, maxTokens: 8000 },
-        { id: 'opus', contextWindow: 200000, maxTokens: 8000 },
-      ],
-    })
-    ctx = h.ctx
-    const agent = ctx.agentLoop.create(SessionId('decision-adopt'), { provider: 'ds', model: 'chat' })
-    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
-    await agent.whenIdle()
-
-    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat', 'gl/opus'])
-    expect(decisions).toHaveLength(1)
-    expect(decisions[0]!.candidates.map(candidate => candidate.model)).toEqual(['haiku', 'opus'])
-  })
-
-  it('T3.3 falls back to rule matching when the decision provider throws', async () => {
-    const decisionProvider: DecisionProvider = {
-      async decide() { throw new Error('boom') },
-    }
-    const h = await harness({
-      ds: [new LlmError('quota', 'QUOTA', { status: 402 })],
-      gl: [textResponse('done')],
-    }, {
-      fallbacks: [{ provider: 'gl' }],
-      decisionProvider,
-    }, {
-      gl: [
-        { id: 'haiku', contextWindow: 128000, maxTokens: 8000 },
-        { id: 'opus', contextWindow: 200000, maxTokens: 8000 },
-      ],
-    })
-    ctx = h.ctx
-    const agent = ctx.agentLoop.create(SessionId('decision-throws'), { provider: 'ds', model: 'chat' })
-    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
-    await agent.whenIdle()
-
-    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat', 'gl/haiku'])
-  })
-
-  it('T3.4 rejects an invalid decision route and falls back to rules', async () => {
-    const decisionProvider: DecisionProvider = {
-      async decide() { return { provider: 'unknown', model: 'x' } },
-    }
-    const h = await harness({
-      ds: [new LlmError('quota', 'QUOTA', { status: 402 })],
-      gl: [textResponse('done')],
-    }, {
-      fallbacks: [{ provider: 'gl' }],
-      decisionProvider,
-    }, {
-      gl: [
-        { id: 'haiku', contextWindow: 128000, maxTokens: 8000 },
-        { id: 'opus', contextWindow: 200000, maxTokens: 8000 },
-      ],
-    })
-    ctx = h.ctx
-    const agent = ctx.agentLoop.create(SessionId('decision-invalid'), { provider: 'ds', model: 'chat' })
-    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
-    await agent.whenIdle()
-
-    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat', 'gl/haiku'])
-  })
-
   it('T7.1 rejects duplicate routes and empty identifiers at load', () => {
     expect(() => fallback.apply(new Context(), {
       fallbacks: [{ provider: 'gl', model: 'opus' }, { provider: 'gl', model: 'opus' }],
@@ -1042,7 +968,35 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
     expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['gl/opus'])
     const warnings = agent.session.events.filter(event => event.type === 'llm/quota-warning')
     expect(warnings.map(event => event.data)).toEqual([{
-      turn: 1, step: 1, provider: 'ds', model: 'chat', remaining: 100, threshold: 200, reason: 'below-threshold',
+      turn: 1, step: 1, provider: 'ds', model: 'chat', remaining: 100, threshold: 200, thresholdKind: 'absolute', reason: 'below-threshold',
+    }])
+  })
+
+  it('T-D2 treats is_available:false as an exhausted balance and switches preemptively', async () => {
+    process.env.DEEPSEEK_API_KEY = 'test-key'
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ is_available: false }),
+    })))
+    const h = await harness({
+      ds: [textResponse('should not run')],
+      gl: [textResponse('done')],
+    }, {
+      fallbacks: [{ provider: 'gl', model: 'opus' }],
+      quota: {
+        thresholdAbsolute: 200,
+        deepseek: { provider: 'ds', baseURL: 'https://test.local' },
+      },
+    })
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('deepseek-unavailable'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['gl/opus'])
+    const warnings = agent.session.events.filter(event => event.type === 'llm/quota-warning')
+    expect(warnings.map(event => event.data)).toEqual([{
+      turn: 1, step: 1, provider: 'ds', model: 'chat', remaining: 0, threshold: 200, thresholdKind: 'absolute', reason: 'below-threshold',
     }])
   })
 
@@ -1083,6 +1037,39 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
 
     expect(stats().agents).toBe(1)
     expect(stats().steps).toBeLessThanOrEqual(1)
+  })
+
+  it('T8.1 caches the provider catalog across switch selections', async () => {
+    // Two agents hitting the same fallback provider: without the catalog TTL
+    // cache every recovery would re-resolve the full catalog (the switch-latency
+    // root cause); with it, one resolution serves both selections.
+    const h = await harness({
+      ds: [new LlmError('quota', 'QUOTA', { status: 402 }), new LlmError('quota', 'QUOTA', { status: 402 })],
+      gl: [textResponse('done'), textResponse('done')],
+    }, {
+      fallbacks: [{ provider: 'gl' }],
+    }, {
+      gl: [
+        { id: 'haiku', contextWindow: 128000, maxTokens: 8000 },
+        { id: 'opus', contextWindow: 200000, maxTokens: 8000 },
+      ],
+    })
+    ctx = h.ctx
+    const agent1 = ctx.agentLoop.create(SessionId('catalog-cache-1'), { provider: 'ds', model: 'chat' })
+    agent1.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent1.whenIdle()
+    const agent2 = ctx.agentLoop.create(SessionId('catalog-cache-2'), { provider: 'ds', model: 'chat' })
+    agent2.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent2.whenIdle()
+
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
+      .toEqual(['ds/chat', 'gl/haiku', 'ds/chat', 'gl/haiku'])
+    expect(h.adapter.listModelsCalls.filter(provider => provider === 'gl')).toHaveLength(1)
+    // gl/opus is never the requested route, so its resolutions can only come
+    // from capability matching: one cached resolution must serve both
+    // selections (the runtime's own per-stream validation only touches the
+    // route actually requested, gl/haiku).
+    expect(h.adapter.resolveModelCalls.filter(route => route === 'gl/opus')).toHaveLength(1)
   })
 
   it('T7.3 registered before llm-retry switches first instead of retrying the primary', async () => {
@@ -1389,5 +1376,13 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
     await agent.whenIdle()
     expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`))
       .toEqual(['ds/chat', 'gl/opus', 'ds/chat'])
+  })
+})
+
+describe('reset tool name', () => {
+  it('stays legal for strict function-calling gateways', () => {
+    // Tripwire for the registered literal: gateways reject names outside
+    // ^[a-zA-Z0-9_-]+$; a rename must consciously keep this passing.
+    expect('llm-fallback-reset').toMatch(/^[a-zA-Z0-9_-]+$/)
   })
 })

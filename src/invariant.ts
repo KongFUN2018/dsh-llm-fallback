@@ -54,7 +54,7 @@ function validateWarning(
   event: SessionEvent<'llm/quota-warning'>,
   fail: InvariantFailure,
 ): void {
-  const { turn, step, provider, model, remaining, total, threshold, estimatedCost, inputPrice, outputPrice, reason, mode } = event.data
+  const { turn, step, provider, model, remaining, total, threshold, thresholdKind, estimatedCost, inputPrice, outputPrice, reason, mode } = event.data
   if (!Number.isSafeInteger(turn) || turn < 1) fail('llm/quota-warning turn must be a positive safe integer')
   if (!Number.isSafeInteger(step) || step < 1) fail('llm/quota-warning step must be a positive safe integer')
   if (typeof provider !== 'string' || provider.length === 0) fail('llm/quota-warning provider must be a non-empty string')
@@ -62,6 +62,7 @@ function validateWarning(
   if (remaining !== undefined && (typeof remaining !== 'number' || remaining < 0)) fail('llm/quota-warning remaining must be non-negative when present')
   if (total !== undefined && (typeof total !== 'number' || total < 0)) fail('llm/quota-warning total must be non-negative when present')
   if (threshold !== undefined && (typeof threshold !== 'number' || threshold < 0)) fail('llm/quota-warning threshold must be non-negative when present')
+  if (thresholdKind !== undefined && thresholdKind !== 'absolute' && thresholdKind !== 'ratio') fail("llm/quota-warning thresholdKind must be 'absolute' | 'ratio' when present")
   if (estimatedCost !== undefined && (typeof estimatedCost !== 'number' || estimatedCost < 0)) fail('llm/quota-warning estimatedCost must be non-negative when present')
   if (inputPrice !== undefined && (typeof inputPrice !== 'number' || inputPrice < 0)) fail('llm/quota-warning inputPrice must be non-negative when present')
   if (outputPrice !== undefined && (typeof outputPrice !== 'number' || outputPrice < 0)) fail('llm/quota-warning outputPrice must be non-negative when present')

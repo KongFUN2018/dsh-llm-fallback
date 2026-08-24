@@ -75,26 +75,37 @@ export function FallbackNodeView({ node }: { node: { readonly data: FallbackChat
   )
 }
 
-/** Keyed chat renderer for one llm/quota-warning preemptive-switch notice. */
-export function QuotaWarningNodeView({ node }: { node: { readonly data: QuotaWarningChatData } }) {
-  const data = node.data
-  const remaining = data.remaining
-  const main = data.reason === 'unobservable'
-    ? fbT('warning.unobservableProbe', { route: data.route })
-    : data.reason === 'insufficient-cost' && remaining !== undefined
-      ? fbT('warning.insufficientCost', { route: data.route, remaining: String(remaining) })
-      : remaining !== undefined && data.threshold !== undefined
+/** Pick the warning copy for one quota-warning row. A `below-threshold` event
+ * always carries remaining and threshold (the trip requires a disclosed
+ * remaining), so the unknown-remainder variant only guards against externally
+ * forged payloads. */
+function warningText(data: QuotaWarningChatData): string {
+  switch (data.reason) {
+    case 'unobservable':
+      return fbT('warning.unobservableProbe', { route: data.route })
+    case 'insufficient-cost':
+      return data.remaining !== undefined
+        ? fbT('warning.insufficientCost', { route: data.route, remaining: String(data.remaining) })
+        : fbT('warning.belowThresholdUnknown', { route: data.route })
+    case 'below-threshold':
+      return data.remaining !== undefined && data.threshold !== undefined
         ? fbT('warning.belowThreshold', {
           route: data.route,
-          remaining: String(remaining),
+          remaining: String(data.remaining),
           threshold: String(data.threshold),
         })
         : fbT('warning.belowThresholdUnknown', { route: data.route })
+  }
+}
+
+/** Keyed chat renderer for one llm/quota-warning preemptive-switch notice. */
+export function QuotaWarningNodeView({ node }: { node: { readonly data: QuotaWarningChatData } }) {
+  const data = node.data
   return (
     <div style={rowStyle} data-dsh-llm-fallback="quota-warning">
       <div style={lineStyle}>
         <span style={iconStyle} aria-hidden>⚠</span>
-        <span>{main}</span>
+        <span>{warningText(data)}</span>
         {strategyDetail(data.mode, undefined)}
       </div>
     </div>

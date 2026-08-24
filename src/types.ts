@@ -130,6 +130,8 @@ export interface LlmQuotaWarningEventData {
   total?: number
   /** Threshold that was crossed. */
   threshold?: number
+  /** Which shape `threshold` expresses when present: an absolute remaining amount or a remaining/total ratio. */
+  thresholdKind?: 'absolute' | 'ratio'
   /** Estimated cost of this request in the provider's unit, when priced. */
   estimatedCost?: number
   /** Input unit price (per million tokens) used in the estimate. */
@@ -142,34 +144,6 @@ export interface LlmQuotaWarningEventData {
   reason: 'below-threshold' | 'insufficient-cost' | 'unobservable'
   /** Strategy mode that selected the target, when a strategy was active. */
   mode?: StrategyMode
-}
-
-/** One candidate route surfaced to a pluggable decision provider. */
-export interface DecisionCandidateInfo {
-  provider: string
-  model: string
-  contextWindow?: number
-  modalities?: string[]
-}
-
-/** Input handed to a pluggable decision provider. */
-export interface DecisionInput {
-  /** Primary route capability signals. */
-  primary: {
-    contextWindow?: number
-    modalities?: string[]
-  }
-  /** All eligible candidate routes, with resolved capability signals. */
-  candidates: readonly DecisionCandidateInfo[]
-}
-
-/**
- * Pluggable model-selection decision provider. When configured, its result is
- * adopted after validation; any throw, timeout, or invalid route falls back to
- * rule-based matching.
- */
-export interface DecisionProvider {
-  decide(input: DecisionInput): Promise<{ provider: string; model: string } | undefined>
 }
 
 declare module '@deepseek-ai/dsh-session/types' {

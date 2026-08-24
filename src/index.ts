@@ -11,17 +11,14 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import type { LlmCallConfig, ModelModality } from '@deepseek-ai/dsh-llm'
+import type { LlmCallConfig, LlmModelInfo, LlmResolvedModelInfo, ModelModality } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
-import type { DecisionCandidateInfo, DecisionInput, DecisionProvider, LlmFallbackRoute, QuotaCheck, QuotaProvider, QuotaStaticEntry, SelectionPreference, StrategyConfig, StrategyMode } from './types.ts'
+import type { LlmFallbackRoute, QuotaCheck, QuotaProvider, QuotaStaticEntry, SelectionPreference, StrategyConfig, StrategyMode } from './types.ts'
 import type { PriceTable, StrategyCandidate, StrategySettings } from './strategy.ts'
 import { priceOf, selectByStrategy } from './strategy.ts'
 
 export type {
-  DecisionCandidateInfo,
-  DecisionInput,
-  DecisionProvider,
   LlmFallbackEventData,
   LlmFallbackRoute,
   LlmQuotaWarningEventData,
@@ -126,8 +123,6 @@ export interface Config {
   preference?: SelectionPreference
   /** Strategy-mode selection (see docs/strategy-design.md); `closest` (or absent) keeps the legacy lazy chain walk. */
   strategy?: StrategyConfig
-  /** Pluggable LLM decision provider; falls back to rule matching on failure. */
-  decisionProvider?: DecisionProvider
   /** Preemptive quota warnings. */
   quota?: {
     /** Switch when remaining allowance falls below this absolute amount. */
@@ -192,7 +187,6 @@ export const Config: z<Config> = z.object({
       afterFailures: z.number().min(1).default(2),
     }),
   }),
-  decisionProvider: z.any(),
   quota: z.object({
     thresholdAbsolute: z.number().min(0),
     thresholdRatio: z.number().min(0).max(1),
@@ -341,16 +335,10 @@ function matchModel(
   }
 
   let group: Candidate[]
-  if (target === undefined) {
-    group = nonDegrading.length > 0 ? nonDegrading
-      : opts.allowUnknownCapacity ? unknown
-      : []
-  } else {
-    group = nonDegrading.length > 0 ? nonDegrading
-      : opts.allowDegrade ? degrading
-      : opts.allowUnknownCapacity ? unknown
-      : []
-  }
+  group = nonDegrading.length > 0 ? nonDegrading
+    : opts.allowDegrade ? degrading
+    : opts.allowUnknownCapacity ? unknown
+    : []
   if (group.length === 0) return undefined
 
   if (opts.preference !== 'closest' || target !== undefined) {
@@ -384,28 +372,54 @@ function compareCandidates(
   }
 }
 
+/** How long a provider's catalog (model list + per-model info) stays cached;
+ * catalogs change at provider pace, not request pace. */
+const CATALOG_CACHE_TTL_MS = 60_000
+
+/** TTL-cached view over `ctx.llm` catalog lookups: `listModels` per provider,
+ * `resolveModelInfo` per provider/model. Only successes are cached; failures
+ * propagate unchanged, so the never-block philosophy keeps its behavior. */
+interface CatalogCache {
+  listModels(provider: string): Promise<readonly LlmModelInfo[]>
+  resolveModelInfo(provider: string, model: string): Promise<LlmResolvedModelInfo>
+}
+
+function createCatalogCache(ctx: Context): CatalogCache {
+  const modelsCache = new Map<string, { at: number; models: readonly LlmModelInfo[] }>()
+  const infoCache = new Map<string, { at: number; info: LlmResolvedModelInfo }>()
+  const listModels = (provider: string): Promise<readonly LlmModelInfo[]> => {
+    const hit = modelsCache.get(provider)
+    if (hit !== undefined && Date.now() - hit.at < CATALOG_CACHE_TTL_MS) return Promise.resolve(hit.models)
+    return ctx.llm.listModels(provider).then(models => {
+      modelsCache.set(provider, { at: Date.now(), models })
+      return models
+    })
+  }
+  const resolveModelInfo = (provider: string, model: string): Promise<LlmResolvedModelInfo> => {
+    const hit = infoCache.get(routeKey({ provider, model }))
+    if (hit !== undefined && Date.now() - hit.at < CATALOG_CACHE_TTL_MS) return Promise.resolve(hit.info)
+    return ctx.llm.resolveModelInfo(provider, model).then(info => {
+      infoCache.set(routeKey({ provider, model }), { at: Date.now(), info })
+      return info
+    })
+  }
+  return { listModels, resolveModelInfo }
+}
+
 /** Resolve one exact route's capability signals; a resolve failure degrades to
  * an empty capability (unknown window/modalities) rather than blocking the
  * request — consistent with the plugin's "never block" philosophy. */
-async function capabilityOf(ctx: Context, route: Route): Promise<Capability> {
-  const info = await ctx.llm.resolveModelInfo(route.provider, route.model).catch(() => undefined)
+async function capabilityOf(catalog: CatalogCache, route: Route): Promise<Capability> {
+  const info = await catalog.resolveModelInfo(route.provider, route.model).catch(() => undefined)
   return {
     ...info === undefined || info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
     ...info === undefined || info.inputModalities === undefined ? {} : { modalities: info.inputModalities },
   }
 }
 
-interface QuotaConfig {
-  thresholdAbsolute?: number
-  thresholdRatio?: number
-  static?: Record<string, QuotaStaticEntry>
-  providers?: QuotaProvider[]
-  cacheMs?: number
-  queryers?: Record<string, { endpoint: string; apiKeyEnv?: string }>
-  deepseek?: { provider?: string; apiKeyEnv?: string; baseURL?: string }
-  prices?: Record<string, { input?: number; output?: number }>
-  estimatedOutputTokens?: number
-}
+/** The resolved quota configuration, derived from the public config so the
+ * schema and the engine can never drift apart. */
+type QuotaConfig = Config['quota']
 
 /** Rough input-token estimate from the serialized message history (chars / 4). */
 function estimateInputTokens(session: Session): number {
@@ -429,30 +443,26 @@ function estimateCost(
   return { cost: (inputTokens * inputPrice + outputTokens * outputPrice) / 1_000_000, inputPrice, outputPrice }
 }
 
-/** Fetch one balance endpoint and parse the DeepSeek `/user/balance` shape; `undefined` on any failure. */
+/** Fetch one balance endpoint and parse the DeepSeek `/user/balance` shape.
+ * Throws on transport/HTTP/parse failure (probe failure); returns `undefined`
+ * only for a well-formed response that discloses no balance (unobservable). */
 async function queryBalanceEndpoint(endpoint: string, apiKey: string, signal: AbortSignal): Promise<QuotaCheck | undefined> {
-  let response: Response
-  try {
-    response = await fetch(endpoint, {
-      method: 'GET',
-      headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' },
-      signal,
-    })
-  } catch {
-    return undefined
-  }
-  if (!response.ok) return undefined
-  try {
-    const data = await response.json() as { is_available?: boolean; balance_infos?: Array<{ total_balance?: string }> }
-    if (data.is_available === false) return { kind: 'balance', remaining: 0 }
-    const total = data.balance_infos?.[0]?.total_balance === undefined
-      ? undefined
-      : Number.parseFloat(data.balance_infos[0].total_balance)
-    if (total === undefined || Number.isNaN(total)) return undefined
-    return { kind: 'balance', remaining: total }
-  } catch {
-    return undefined
-  }
+  const response = await fetch(endpoint, {
+    method: 'GET',
+    headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' },
+    signal,
+  })
+  if (!response.ok) throw new Error(`balance endpoint ${endpoint} responded ${response.status}`)
+  const data = await response.json() as { is_available?: boolean; balance_infos?: Array<{ total_balance?: string }> }
+  // `is_available: false` marks the account unusable (frozen or blocked), which
+  // the kind vocabulary cannot distinguish from an exhausted balance; mapping
+  // it to balance-0 makes the preemptive check treat it as underfunded.
+  if (data.is_available === false) return { kind: 'balance', remaining: 0 }
+  const total = data.balance_infos?.[0]?.total_balance === undefined
+    ? undefined
+    : Number.parseFloat(data.balance_infos[0].total_balance)
+  if (total === undefined || Number.isNaN(total)) return undefined
+  return { kind: 'balance', remaining: total }
 }
 
 /** Exclude a failed route until, based on its allowance kind. */
@@ -467,14 +477,14 @@ function banUntil(provider: string, cooldownMs: number, quota: QuotaConfig | und
 function belowThreshold(
   check: QuotaCheck,
   quota: QuotaConfig | undefined,
-): { below: boolean; threshold?: number } {
+): { below: boolean; threshold?: number; thresholdKind?: 'absolute' | 'ratio' } {
   if (check.remaining === undefined) return { below: false }
   if (quota?.thresholdAbsolute !== undefined && check.remaining < quota.thresholdAbsolute) {
-    return { below: true, threshold: quota.thresholdAbsolute }
+    return { below: true, threshold: quota.thresholdAbsolute, thresholdKind: 'absolute' }
   }
   if (quota?.thresholdRatio !== undefined && check.total !== undefined && check.total > 0) {
     if (check.remaining / check.total < quota.thresholdRatio) {
-      return { below: true, threshold: quota.thresholdRatio }
+      return { below: true, threshold: quota.thresholdRatio, thresholdKind: 'ratio' }
     }
   }
   return { below: false }
@@ -482,15 +492,15 @@ function belowThreshold(
 
 /** Resolve one provider's candidate catalog with per-candidate capability. */
 async function selectModel(
-  ctx: Context,
+  catalog: CatalogCache,
   primary: Capability,
   provider: string,
   opts: MatchOptions,
 ): Promise<string | undefined> {
-  const models = await ctx.llm.listModels(provider)
+  const models = await catalog.listModels(provider)
   const candidates: Candidate[] = []
   for (const model of models) {
-    const info = await ctx.llm.resolveModelInfo(provider, model.id)
+    const info = await catalog.resolveModelInfo(provider, model.id)
     candidates.push({
       id: model.id,
       capability: {
@@ -515,47 +525,56 @@ interface StrategyRun {
   signal: AbortSignal
 }
 
+/** The chain-cursor directive a selection path returns.
+ *  - `advanceTo`: the next chain index to try (rule/decision paths walk forward).
+ *  - `reselectFrom`: stay at this index — a global re-selection must still see
+ *    this entry's siblings and every later entry, with the ban table (not the
+ *    cursor) preventing revisits (strategy path). */
+type CursorDirective =
+  | { advanceTo: number }
+  | { reselectFrom: number }
+
 /** The outcome of any selection path; strategy fields appear only when strategic. */
 interface SelectionOutcome {
   route: ResolvedRoute
-  nextCursor: number
+  cursor: CursorDirective
   mode?: Exclude<StrategyMode, 'closest'>
   score?: number
 }
 
+/** The numeric chain index a cursor directive leaves the walk at. */
+function cursorIndexOf(directive: CursorDirective): number {
+  return 'advanceTo' in directive ? directive.advanceTo : directive.reselectFrom
+}
+
 /** Walk the chain from a cursor, resolving each entry to a concrete route. */
 async function selectNext(
-  ctx: Context,
+  catalog: CatalogCache,
   chain: readonly LlmFallbackRoute[],
   cursor: number,
   primary: Capability,
   opts: MatchOptions,
   banned: ReadonlyMap<string, number>,
   now: number,
-  decisionProvider?: DecisionProvider,
   strategy?: StrategyRun,
 ): Promise<SelectionOutcome | undefined> {
-  if (decisionProvider !== undefined) {
-    const decided = await selectNextByDecision(ctx, chain, cursor, primary, banned, now, decisionProvider)
-    if (decided !== undefined) return decided
-  }
   if (strategy !== undefined) {
-    const strategic = await selectNextByStrategy(ctx, chain, cursor, primary, opts, strategy, banned, now)
+    const strategic = await selectNextByStrategy(catalog, chain, cursor, primary, opts, strategy, banned, now)
     if (strategic !== undefined) return strategic
   }
-  return selectNextByRules(ctx, chain, cursor, primary, opts, banned, now)
+  return selectNextByRules(catalog, chain, cursor, primary, opts, banned, now)
 }
 
 /** Rule-based lazy walk over the chain. */
 async function selectNextByRules(
-  ctx: Context,
+  catalog: CatalogCache,
   chain: readonly LlmFallbackRoute[],
   cursor: number,
   primary: Capability,
   opts: MatchOptions,
   banned: ReadonlyMap<string, number>,
   now: number,
-): Promise<{ route: ResolvedRoute; nextCursor: number } | undefined> {
+): Promise<SelectionOutcome | undefined> {
   let index = cursor
   while (index < chain.length) {
     const entry = chain[index]
@@ -572,10 +591,10 @@ async function selectNextByRules(
           model: entry.model,
           ...entry.reasoningEffort === undefined ? {} : { reasoningEffort: entry.reasoningEffort },
         },
-        nextCursor: index + 1,
+        cursor: { advanceTo: index + 1 },
       }
     }
-    const selected = await selectModel(ctx, primary, entry.provider, opts)
+    const selected = await selectModel(catalog, primary, entry.provider, opts)
     if (selected !== undefined) {
       const until = banned.get(routeKey({ provider: entry.provider, model: selected }))
       if (until !== undefined && until > now) {
@@ -588,7 +607,7 @@ async function selectNextByRules(
           model: selected,
           ...entry.reasoningEffort === undefined ? {} : { reasoningEffort: entry.reasoningEffort },
         },
-        nextCursor: index + 1,
+        cursor: { advanceTo: index + 1 },
       }
     }
     index += 1
@@ -596,72 +615,10 @@ async function selectNextByRules(
   return undefined
 }
 
-/** Decision-provider path: expand all candidates, then adopt a validated result. */
-async function selectNextByDecision(
-  ctx: Context,
-  chain: readonly LlmFallbackRoute[],
-  cursor: number,
-  primary: Capability,
-  banned: ReadonlyMap<string, number>,
-  now: number,
-  decisionProvider: DecisionProvider,
-): Promise<{ route: ResolvedRoute; nextCursor: number } | undefined> {
-  const candidates: DecisionCandidateInfo[] = []
-  const routes: { provider: string; model: string; index: number; reasoningEffort?: string }[] = []
-  for (let index = cursor; index < chain.length; index++) {
-    const entry = chain[index]
-    if (entry === undefined) continue
-    const ids: string[] = []
-    if (entry.model !== undefined) {
-      ids.push(entry.model)
-    } else {
-      const models = await ctx.llm.listModels(entry.provider)
-      ids.push(...models.map(model => model.id))
-    }
-    for (const id of ids) {
-      const until = banned.get(routeKey({ provider: entry.provider, model: id }))
-      if (until !== undefined && until > now) continue
-      const capability = await capabilityOf(ctx, { provider: entry.provider, model: id })
-      candidates.push({
-        provider: entry.provider,
-        model: id,
-        ...capability.contextWindow === undefined ? {} : { contextWindow: capability.contextWindow },
-        ...capability.modalities === undefined ? {} : { modalities: [...capability.modalities] },
-      })
-      routes.push({
-        provider: entry.provider,
-        model: id,
-        index,
-        ...entry.reasoningEffort === undefined ? {} : { reasoningEffort: entry.reasoningEffort },
-      })
-    }
-  }
-  if (routes.length === 0) return undefined
-  const input: DecisionInput = {
-    primary: {
-      ...primary.contextWindow === undefined ? {} : { contextWindow: primary.contextWindow },
-      ...primary.modalities === undefined ? {} : { modalities: [...primary.modalities] },
-    },
-    candidates,
-  }
-  const decided = await decisionProvider.decide(input).catch(() => undefined)
-  if (decided === undefined) return undefined
-  const route = routes.find(candidate => candidate.provider === decided.provider && candidate.model === decided.model)
-  if (route === undefined) return undefined
-  return {
-    route: {
-      provider: route.provider,
-      model: route.model,
-      ...route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort },
-    },
-    nextCursor: route.index + 1,
-  }
-}
-
 /** Strategy path (docs/strategy-design.md): expand the whole chain, apply the
  * hard task-completion floor, then score globally under the active mode. */
 async function selectNextByStrategy(
-  ctx: Context,
+  catalog: CatalogCache,
   chain: readonly LlmFallbackRoute[],
   cursor: number,
   primary: Capability,
@@ -679,13 +636,13 @@ async function selectNextByStrategy(
     if (entry.model !== undefined) {
       ids.push(entry.model)
     } else {
-      const models = await ctx.llm.listModels(entry.provider)
+      const models = await catalog.listModels(entry.provider)
       ids.push(...models.map(model => model.id))
     }
     for (const id of ids) {
       const until = banned.get(routeKey({ provider: entry.provider, model: id }))
       if (until !== undefined && until > now) continue
-      const info = await ctx.llm.resolveModelInfo(entry.provider, id)
+      const info = await catalog.resolveModelInfo(entry.provider, id)
       const price = priceOf(run.prices, entry.provider, id)
       const projected = price === undefined || (price.input === undefined && price.output === undefined)
         ? undefined
@@ -723,13 +680,185 @@ async function selectNextByStrategy(
       model: candidate.model,
       ...candidate.reasoningEffort === undefined ? {} : { reasoningEffort: candidate.reasoningEffort },
     },
-    // Stay at the winning entry: a global re-selection must still see this
-    // entry's siblings (the ban table, not the cursor, prevents revisiting
-    // a failed route) and every later entry.
-    nextCursor: candidate.chainIndex,
+    cursor: { reselectFrom: candidate.chainIndex },
     mode: selection.mode,
     ...selection.score === undefined ? {} : { score: selection.score },
   }
+}
+
+/** The quota engine: multi-source interrogation with TTL cache, single-flight,
+ * probe-failure diagnostics, and a shared clear for resets. */
+interface QuotaEngine {
+  checkQuota(provider: string, model: string, signal: AbortSignal, force?: boolean): Promise<QuotaCheck | undefined>
+  clearAll(): void
+}
+
+/** Build the quota engine over the resolved precedence chain: static table,
+ * pluggable providers, declarative queryers, then the built-in DeepSeek source.
+ * Any interrogation failure resolves to `undefined` (unobservable) and never
+ * blocks a request, but is counted and logged as a probe failure. */
+function createQuotaEngine(ctx: Context, quota: QuotaConfig | undefined): QuotaEngine {
+  const quotaCache = new Map<string, { check: QuotaCheck | undefined; at: number }>()
+  const quotaInFlight = new Map<string, Promise<QuotaCheck | undefined>>()
+  const quotaCacheMs = quota?.cacheMs ?? 30_000
+  const log = ctx.logger('llm-fallback')
+  const resolveApiKey = async (ref: string): Promise<string | undefined> => {
+    const credentials = ctx.get('credentials') as CredentialProvider | undefined
+    if (credentials !== undefined) {
+      const hit = await credentials.resolve(credentialRef(ref))
+      if (hit !== undefined) return hit.value
+    }
+    const ambient = process.env[ref]
+    return ambient !== undefined && ambient.length > 0 ? ambient : undefined
+  }
+  const checkQuota = async (provider: string, model: string, signal: AbortSignal, force = false): Promise<QuotaCheck | undefined> => {
+    const staticEntry = quota?.static?.[provider]
+    if (staticEntry !== undefined) return staticEntry
+    // A forced check (e.g. right after the user switches models) bypasses the
+    // TTL cache and any in-flight dedup so the new route is interrogated fresh;
+    // its result is still written back to the cache for later reads.
+    if (!force) {
+      const cached = quotaCache.get(provider)
+      if (cached !== undefined && Date.now() - cached.at < quotaCacheMs) return cached.check
+      const pending = quotaInFlight.get(provider)
+      if (pending !== undefined) return pending
+    }
+    const task = (async (): Promise<QuotaCheck | undefined> => {
+      let probeFailures = 0
+      const probe = (attempt: Promise<QuotaCheck | undefined>): Promise<QuotaCheck | undefined> =>
+        attempt.catch(() => { probeFailures += 1; return undefined })
+      for (const source of quota?.providers ?? []) {
+        const result = await probe(source.check(provider, model, signal))
+        if (result !== undefined) return result
+      }
+      const queryer = quota?.queryers?.[provider]
+      if (queryer !== undefined) {
+        const result = await probe((async () => {
+          const key = await resolveApiKey(queryer.apiKeyEnv ?? '')
+          return queryBalanceEndpoint(queryer.endpoint, key ?? '', signal)
+        })())
+        if (result !== undefined) return result
+      }
+      const deepseek = quota?.deepseek
+      if (deepseek !== undefined && provider === (deepseek.provider ?? 'deepseek-official')) {
+        const result = await probe((async () => {
+          const key = await resolveApiKey(deepseek.apiKeyEnv ?? 'DEEPSEEK_API_KEY')
+          if (key === undefined) return undefined
+          return queryBalanceEndpoint(`${deepseek.baseURL ?? 'https://api.deepseek.com'}/user/balance`, key, signal)
+        })())
+        if (result !== undefined) return result
+      }
+      // Distinguish "probe failed" from "genuinely unobservable": a failed
+      // interrogation is a transient fault, not an absent source.
+      if (probeFailures > 0) {
+        log.warn(`quota probe failed for provider "${provider}" (${probeFailures} source(s) threw); treating as unobservable`)
+      }
+      return undefined
+    })()
+    quotaInFlight.set(provider, task)
+    try {
+      const result = await task
+      quotaCache.set(provider, { check: result, at: Date.now() })
+      return result
+    } finally {
+      quotaInFlight.delete(provider)
+    }
+  }
+  return {
+    checkQuota,
+    clearAll: () => {
+      quotaCache.clear()
+      quotaInFlight.clear()
+    },
+  }
+}
+
+/** Per-agent routing-state tracker: the WeakMap/Set state, the derived stats
+ * and reset faces, and the step-state helpers the request handlers drive. */
+interface AgentTracker {
+  states: WeakMap<Agent, AgentState>
+  sessionAgents: WeakMap<Session, Agent>
+  knownAgents: Set<Agent>
+  stats(): FallbackStats
+  reset(): ResetSummary
+  stateFor(agent: Agent): AgentState
+  stepFor(agent: Agent, turn: number, step: number): StepState
+}
+
+/** Build the agent tracker and register its stats/reset faces plus the
+ * `agent/disposed` strong-reference cleanup on the given context. */
+function createAgentTracker(ctx: Context, clearQuota: () => void): AgentTracker {
+  const states = new WeakMap<Agent, AgentState>()
+  const sessionAgents = new WeakMap<Session, Agent>()
+  const knownAgents = new Set<Agent>()
+  const stats = (): { agents: number; steps: number } => {
+    let steps = 0
+    for (const agent of knownAgents) {
+      const agentState = states.get(agent)
+      if (agentState !== undefined) steps += agentState.steps.size
+    }
+    return { agents: knownAgents.size, steps }
+  }
+  fallbackStatsRegistry.set(ctx, stats)
+  // Drop a disposed agent's strong reference so the set tracks live agents only
+  // (WeakMap already lets `states`/`sessionAgents` GC; `knownAgents` is iterated
+  // by reset/poll, so it must be pruned explicitly on registry removal).
+  ctx.on('agent/disposed', (payload) => {
+    knownAgents.delete(payload.agent)
+  }, { global: true })
+  const reset = (): ResetSummary => {
+    let clearedBans = 0
+    let clearedFailures = 0
+    let clearedSteps = 0
+    for (const agent of [...knownAgents]) {
+      const agentState = states.get(agent)
+      if (agentState === undefined) continue
+      clearedBans += agentState.bannedUntil.size
+      clearedFailures += agentState.failedRoutes.size
+      clearedSteps += agentState.steps.size
+      agentState.bannedUntil.clear()
+      agentState.failedRoutes.clear()
+      agentState.steps.clear()
+      agentState.healthyRoute = undefined
+      agentState.switchedKeys.clear()
+    }
+    // Also drop cached/in-flight allowances so the next request re-interrogates.
+    clearQuota()
+    return {
+      resetAgents: knownAgents.size,
+      clearedBans,
+      clearedFailures,
+      clearedSteps,
+    } satisfies ResetSummary
+  }
+  resetRegistry.set(ctx, reset)
+  const stateFor = (agent: Agent): AgentState => {
+    let state = states.get(agent)
+    if (state === undefined) {
+      state = { steps: new Map(), healthyRoute: undefined, switchedKeys: new Set(), bannedUntil: new Map(), failedRoutes: new Set(), lastTurn: undefined, primaryRoute: undefined }
+      states.set(agent, state)
+    }
+    return state
+  }
+  const stepFor = (agent: Agent, turn: number, step: number): StepState => {
+    const state = stateFor(agent)
+    const key = stepKey(turn, step)
+    let stepState = state.steps.get(key)
+    if (stepState === undefined) {
+      stepState = {
+        attempts: 0,
+        primary: undefined,
+        lastRoute: { provider: '', model: '' },
+        chainCursor: 0,
+        pendingRoute: undefined,
+        strategyFailures: 0,
+        selectedMode: undefined,
+      }
+      state.steps.set(key, stepState)
+    }
+    return stepState
+  }
+  return { states, sessionAgents, knownAgents, stats, reset, stateFor, stepFor }
 }
 
 /**
@@ -754,63 +883,10 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
   const unusableCodes = new Set(config.unusableCodes ?? DEFAULT_UNUSABLE_CODES)
   const cooldownMs = config.cooldownMs ?? 60_000
   const quota = config.quota
-  const decisionProvider = config.decisionProvider
 
-  // Quota interrogation cache + single-flight (C4): a failure resolves to
-  // 'unobservable' and must not block the request.
-  const quotaCache = new Map<string, { check: QuotaCheck | undefined; at: number }>()
-  const quotaInFlight = new Map<string, Promise<QuotaCheck | undefined>>()
-  const quotaCacheMs = quota?.cacheMs ?? 30_000
-  const resolveApiKey = async (ref: string): Promise<string | undefined> => {
-    const credentials = ctx.get('credentials') as CredentialProvider | undefined
-    if (credentials !== undefined) {
-      const hit = await credentials.resolve(credentialRef(ref))
-      if (hit !== undefined) return hit.value
-    }
-    const ambient = process.env[ref]
-    return ambient !== undefined && ambient.length > 0 ? ambient : undefined
-  }
-  const checkQuota = async (provider: string, model: string, signal: AbortSignal, force = false): Promise<QuotaCheck | undefined> => {
-    const staticEntry = quota?.static?.[provider]
-    if (staticEntry !== undefined) return staticEntry
-    // A forced check (e.g. right after the user switches models) bypasses the
-    // TTL cache and any in-flight dedup so the new route is interrogated fresh;
-    // its result is still written back to the cache for later reads.
-    if (!force) {
-      const cached = quotaCache.get(provider)
-      if (cached !== undefined && Date.now() - cached.at < quotaCacheMs) return cached.check
-      const pending = quotaInFlight.get(provider)
-      if (pending !== undefined) return pending
-    }
-    const task = (async (): Promise<QuotaCheck | undefined> => {
-      for (const source of quota?.providers ?? []) {
-        const result = await source.check(provider, model, signal).catch(() => undefined)
-        if (result !== undefined) return result
-      }
-      const queryer = quota?.queryers?.[provider]
-      if (queryer !== undefined) {
-        const key = await resolveApiKey(queryer.apiKeyEnv ?? '')
-        const result = await queryBalanceEndpoint(queryer.endpoint, key ?? '', signal)
-        if (result !== undefined) return result
-      }
-      if (quota?.deepseek !== undefined && provider === (quota.deepseek.provider ?? 'deepseek-official')) {
-        const key = await resolveApiKey(quota.deepseek.apiKeyEnv ?? 'DEEPSEEK_API_KEY')
-        if (key !== undefined) {
-          const result = await queryBalanceEndpoint(`${quota.deepseek.baseURL ?? 'https://api.deepseek.com'}/user/balance`, key, signal)
-          if (result !== undefined) return result
-        }
-      }
-      return undefined
-    })()
-    quotaInFlight.set(provider, task)
-    try {
-      const result = await task
-      quotaCache.set(provider, { check: result, at: Date.now() })
-      return result
-    } finally {
-      quotaInFlight.delete(provider)
-    }
-  }
+  const engine = createQuotaEngine(ctx, quota)
+  const { checkQuota } = engine
+  const catalog = createCatalogCache(ctx)
   const opts: MatchOptions = {
     allowDegrade: config.allowDegrade ?? false,
     allowUnknownCapacity: config.allowUnknownCapacity ?? false,
@@ -852,49 +928,15 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     checkQuota,
     signal,
   }
-  const states = new WeakMap<Agent, AgentState>()
-  const sessionAgents = new WeakMap<Session, Agent>()
-  const knownAgents = new Set<Agent>()
-  let totalAgents = 0
-  let totalSteps = 0
-  const stats = (): { agents: number; steps: number } => ({ agents: totalAgents, steps: totalSteps })
-  fallbackStatsRegistry.set(ctx, stats)
-  // Reset closure: clear every model-availability decision so all configured
-  // models become usable again regardless of prior plugin state.
-  resetRegistry.set(ctx, () => {
-    let clearedBans = 0
-    let clearedFailures = 0
-    let clearedSteps = 0
-    for (const agent of [...knownAgents]) {
-      const agentState = states.get(agent)
-      if (agentState === undefined) continue
-      clearedBans += agentState.bannedUntil.size
-      clearedFailures += agentState.failedRoutes.size
-      clearedSteps += agentState.steps.size
-      agentState.bannedUntil.clear()
-      agentState.failedRoutes.clear()
-      agentState.steps.clear()
-      agentState.healthyRoute = undefined
-      agentState.switchedKeys.clear()
-      totalSteps = 0
-    }
-    // Also drop cached/in-flight allowances so the next request re-interrogates.
-    quotaCache.clear()
-    quotaInFlight.clear()
-    return {
-      resetAgents: knownAgents.size,
-      clearedBans,
-      clearedFailures,
-      clearedSteps,
-    } satisfies ResetSummary
-  })
+  const tracker = createAgentTracker(ctx, engine.clearAll)
+  const { states, sessionAgents, knownAgents, stateFor, stepFor } = tracker
 
   // Escape-hatch tool: an agent can restore every configured model's usability
   // in one call by discarding all of the plugin's routing decisions.
   const tools = ctx.get('tools') as { register(definition: unknown): () => void } | undefined
   if (tools !== undefined) {
     const disposeTool = tools.register({
-      name: 'llm-fallback/reset',
+      name: 'llm-fallback-reset',
       description: 'Restore every configured model\'s usability in one call: clear all fallback bans, the session-healthy route, cost-risk scores, and step-level selection state owned by the llm-fallback plugin, so the next request re-decides from the user\'s model selection and fallback chain. Use this as an escape hatch when the plugin\'s routing decisions need to be discarded entirely.',
       parameters: {
         type: 'object',
@@ -924,7 +966,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       },
       execute: async (args: unknown) => {
         if (args !== null && typeof args === 'object' && (args as { confirm?: unknown }).confirm !== true) {
-          throw new Error('llm-fallback/reset requires confirm: true')
+          throw new Error('llm-fallback-reset requires confirm: true')
         }
         return resetRegistry.get(ctx)?.() ?? { resetAgents: 0, clearedBans: 0, clearedFailures: 0, clearedSteps: 0 }
       },
@@ -950,36 +992,6 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     ctx.effect(() => disposeCommand, 'llm-fallback: reset command')
   }
 
-  const stateFor = (agent: Agent): AgentState => {
-    let state = states.get(agent)
-    if (state === undefined) {
-      state = { steps: new Map(), healthyRoute: undefined, switchedKeys: new Set(), bannedUntil: new Map(), failedRoutes: new Set(), lastTurn: undefined, primaryRoute: undefined }
-      states.set(agent, state)
-      totalAgents += 1
-    }
-    return state
-  }
-
-  const stepFor = (agent: Agent, turn: number, step: number): StepState => {
-    const state = stateFor(agent)
-    const key = stepKey(turn, step)
-    let stepState = state.steps.get(key)
-    if (stepState === undefined) {
-      stepState = {
-        attempts: 0,
-        primary: undefined,
-        lastRoute: { provider: '', model: '' },
-        chainCursor: 0,
-        pendingRoute: undefined,
-        strategyFailures: 0,
-        selectedMode: undefined,
-      }
-      state.steps.set(key, stepState)
-      totalSteps += 1
-    }
-    return stepState
-  }
-
   // Outermost listener (registered before per-agent model selection): snapshot
   // the primary route, record the issued route, and rewrite it when a recovery
   // has resolved a fallback route.
@@ -991,7 +1003,6 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       for (const key of [...agentState.steps.keys()]) {
         if (key.startsWith(retired)) {
           agentState.steps.delete(key)
-          totalSteps -= 1
         }
       }
     }
@@ -1039,9 +1050,9 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       && quotaCheck?.remaining !== undefined
       && quotaCheck.remaining < projected.cost
     if (trip.below || costTrip) {
-      const primaryCapability = await capabilityOf(ctx, resolved)
+      const primaryCapability = await capabilityOf(catalog, resolved)
       const result = await selectNext(
-        ctx, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(), decisionProvider,
+        catalog, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(),
         strategyRun(strategySettings?.mode, agent.session, agentState.failedRoutes, checkQuota, signal),
       )
       if (result !== undefined) {
@@ -1054,6 +1065,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
           ...quotaCheck?.remaining === undefined ? {} : { remaining: quotaCheck.remaining },
           ...quotaCheck?.total === undefined ? {} : { total: quotaCheck.total },
           ...trip.threshold === undefined ? {} : { threshold: trip.threshold },
+          ...trip.thresholdKind === undefined ? {} : { thresholdKind: trip.thresholdKind },
           ...costTrip && projected !== undefined ? {
             estimatedCost: projected.cost,
             inputPrice: projected.inputPrice,
@@ -1063,7 +1075,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
           ...result.mode === undefined ? {} : { mode: result.mode },
         })
         state.lastRoute = { provider: result.route.provider, model: result.route.model }
-        state.chainCursor = result.nextCursor
+        state.chainCursor = cursorIndexOf(result.cursor)
         return withRoute(resolved, result.route)
       }
     } else if (userSwitched && quotaCheck?.remaining === undefined) {
@@ -1111,15 +1123,15 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       : strategySettings.mode === 'cost' && state.strategyFailures >= escalationAfter
         ? 'performance'
         : strategySettings.mode
-    const primaryCapability = await capabilityOf(ctx, primary)
+    const primaryCapability = await capabilityOf(catalog, primary)
     const result = await selectNext(
-      ctx, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(), decisionProvider,
+      catalog, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(),
       strategyRun(effectiveMode, agent.session, agentState.failedRoutes, checkQuota, signal),
     )
     if (result === undefined) return next()
     agentState.switchedKeys.add(routeKey(result.route))
     state.pendingRoute = result.route
-    state.chainCursor = result.nextCursor
+    state.chainCursor = cursorIndexOf(result.cursor)
     state.selectedMode = result.mode
     agent.session.append('llm/fallback', {
       turn,
@@ -1129,7 +1141,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       toProvider: result.route.provider,
       toModel: result.route.model,
       code: failure.code,
-      remaining: chain.length - result.nextCursor,
+      remaining: chain.length - cursorIndexOf(result.cursor),
       ...result.mode === undefined ? {} : { mode: result.mode },
       ...result.score === undefined ? {} : { score: result.score },
     })
@@ -1139,18 +1151,22 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
   // Poll the primary route's allowance so a recovered allowance clears the
   // session-wide healthy cache in time for the next request.
   if (config.pollIntervalMs !== undefined && config.pollIntervalMs > 0) {
+    const pollAbort = new AbortController()
     const timer = setInterval(async () => {
       for (const agent of knownAgents) {
         const agentState = states.get(agent)
         if (agentState === undefined || agentState.healthyRoute === undefined) continue
         const primary = agentState.primaryRoute
         if (primary === undefined) continue
-        const check = await checkQuota(primary.provider, primary.model, new AbortController().signal)
+        const check = await checkQuota(primary.provider, primary.model, pollAbort.signal)
         if (check === undefined) continue
         if (!belowThreshold(check, quota).below) agentState.healthyRoute = undefined
       }
     }, config.pollIntervalMs)
-    ctx.effect(() => () => clearInterval(timer), 'llm-fallback: stop quota polling')
+    ctx.effect(() => () => {
+      clearInterval(timer)
+      pollAbort.abort()
+    }, 'llm-fallback: stop quota polling')
   }
 
   // Promote a fallback switch to the session-wide healthy cache once the

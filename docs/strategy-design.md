@@ -105,7 +105,7 @@ axes 默认 [reasoning, context, output]（轴序可配置）
 
 原链遍历是惰性、逐条的。模式若只作用于"单 provider 目录内选模型"，会出现链[0] 的最便宜模型比链[1] 的贵——违背"全局性价比最高"语义。
 
-`decisionProvider` 已有全局展开先例（`selectNextByDecision`）。双模式走同一结构：
+双模式走统一的全局展开结构：
 
 ```
 mode = closest            → 保持现状：惰性链遍历（全部既有行为不变）
@@ -113,7 +113,7 @@ mode = cost/performance   → 全局展开所有链候选 → 地板过滤 → �
                               破平：链位置（用户链序作为先验）→ id
 ```
 
-链序从"硬遍历顺序"降级为"破平先验"。派发顺序：`decisionProvider`（LLM 决策优先）→ 策略路径（mode ≠ closest）→ 规则路径（closest）。
+链序从"硬遍历顺序"降级为"破平先验"。派发顺序：策略路径（mode ≠ closest）→ 规则路径（closest）。（历史注：早期版本曾有一层可插拔 `decisionProvider`，因无真实消费者已删除。）
 
 **兼容性**：`preference` 保留原语义（closest 路径的平局偏好）；`strategy.mode` 是策略路径的唯一开关，二者独立，既有配置与测试不受影响。
 

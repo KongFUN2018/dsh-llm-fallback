@@ -6,8 +6,8 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
-import type { DecisionProvider, LlmFallbackRoute, QuotaProvider, QuotaStaticEntry, SelectionPreference, StrategyConfig } from './types.ts';
-export type { DecisionCandidateInfo, DecisionInput, DecisionProvider, LlmFallbackEventData, LlmFallbackRoute, LlmQuotaWarningEventData, QuotaCheck, QuotaKind, QuotaProvider, QuotaStaticEntry, SelectionPreference, StrategyAxis, StrategyConfig, StrategyMode, } from './types.ts';
+import type { LlmFallbackRoute, QuotaProvider, QuotaStaticEntry, SelectionPreference, StrategyConfig } from './types.ts';
+export type { LlmFallbackEventData, LlmFallbackRoute, LlmQuotaWarningEventData, QuotaCheck, QuotaKind, QuotaProvider, QuotaStaticEntry, SelectionPreference, StrategyAxis, StrategyConfig, StrategyMode, } from './types.ts';
 export { buildFloor, comparePerformance, costScore, passesFloor, priceOf, selectByStrategy, } from './strategy.ts';
 export type { PriceTable, StrategyCandidate, StrategySelection, StrategySettings } from './strategy.ts';
 export declare const name = "llm-fallback";
@@ -65,8 +65,6 @@ export interface Config {
     preference?: SelectionPreference;
     /** Strategy-mode selection (see docs/strategy-design.md); `closest` (or absent) keeps the legacy lazy chain walk. */
     strategy?: StrategyConfig;
-    /** Pluggable LLM decision provider; falls back to rule matching on failure. */
-    decisionProvider?: DecisionProvider;
     /** Preemptive quota warnings. */
     quota?: {
         /** Switch when remaining allowance falls below this absolute amount. */
