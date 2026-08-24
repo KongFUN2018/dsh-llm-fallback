@@ -421,10 +421,19 @@ async function capabilityOf(catalog: CatalogCache, route: Route): Promise<Capabi
  * schema and the engine can never drift apart. */
 type QuotaConfig = Config['quota']
 
-/** Rough input-token estimate from the serialized message history (chars / 4). */
+/** Rough input-token estimate from the serialized message history (chars / 4).
+ * Cached per session: the message list only grows within a turn, so we track
+ * the message count and re-serialize only when it changes. */
+const tokenEstimateCache = new WeakMap<Session, { count: number; tokens: number }>()
+
 function estimateInputTokens(session: Session): number {
-  const serialized = JSON.stringify(session.deriveMessages())
-  return Math.max(1, Math.ceil(serialized.length / 4))
+  const messages = session.deriveMessages()
+  const cached = tokenEstimateCache.get(session)
+  if (cached !== undefined && cached.count === messages.length) return cached.tokens
+  const serialized = JSON.stringify(messages)
+  const tokens = Math.max(1, Math.ceil(serialized.length / 4))
+  tokenEstimateCache.set(session, { count: messages.length, tokens })
+  return tokens
 }
 
 /** Projected cost in the provider's unit, when a price is configured for the route. */
@@ -490,7 +499,8 @@ function belowThreshold(
   return { below: false }
 }
 
-/** Resolve one provider's candidate catalog with per-candidate capability. */
+/** Resolve one provider's candidate catalog with per-candidate capability.
+ * Model info lookups are parallelized (no data dependency between models). */
 async function selectModel(
   catalog: CatalogCache,
   primary: Capability,
@@ -498,17 +508,22 @@ async function selectModel(
   opts: MatchOptions,
 ): Promise<string | undefined> {
   const models = await catalog.listModels(provider)
+  const infos = await Promise.all(
+    models.map(model => catalog.resolveModelInfo(provider, model.id).catch(() => undefined)),
+  )
   const candidates: Candidate[] = []
-  for (const model of models) {
-    const info = await catalog.resolveModelInfo(provider, model.id)
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i]
+    const info = infos[i]
+    if (model === undefined) continue
     candidates.push({
       id: model.id,
       capability: {
-        ...info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
-        ...info.inputModalities === undefined ? {} : { modalities: info.inputModalities },
+        ...info === undefined || info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
+        ...info === undefined || info.inputModalities === undefined ? {} : { modalities: info.inputModalities },
       },
-      ...info.defaultMaxTokens === undefined ? {} : { maxTokens: info.defaultMaxTokens },
-      ...info.reasoning === undefined ? {} : { hasReasoning: true },
+      ...info === undefined || info.defaultMaxTokens === undefined ? {} : { maxTokens: info.defaultMaxTokens },
+      ...info === undefined || info.reasoning === undefined ? {} : { hasReasoning: true },
     })
   }
   return matchModel(primary, candidates, opts)
@@ -639,10 +654,16 @@ async function selectNextByStrategy(
       const models = await catalog.listModels(entry.provider)
       ids.push(...models.map(model => model.id))
     }
-    for (const id of ids) {
+    // Parallelize model-info resolution within this chain entry.
+    const infos = await Promise.all(
+      ids.map(id => catalog.resolveModelInfo(entry.provider, id).catch(() => undefined)),
+    )
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i]
+      if (id === undefined) continue
       const until = banned.get(routeKey({ provider: entry.provider, model: id }))
       if (until !== undefined && until > now) continue
-      const info = await catalog.resolveModelInfo(entry.provider, id)
+      const info = infos[i]
       const price = priceOf(run.prices, entry.provider, id)
       const projected = price === undefined || (price.input === undefined && price.output === undefined)
         ? undefined
@@ -658,10 +679,10 @@ async function selectNextByStrategy(
         model: id,
         chainIndex: index,
         ...entry.reasoningEffort === undefined ? {} : { reasoningEffort: entry.reasoningEffort },
-        ...info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
-        ...info.inputModalities === undefined ? {} : { modalities: info.inputModalities },
-        ...info.defaultMaxTokens === undefined ? {} : { maxTokens: info.defaultMaxTokens },
-        ...info.reasoning === undefined ? {} : { hasReasoning: true },
+        ...info === undefined || info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
+        ...info === undefined || info.inputModalities === undefined ? {} : { modalities: info.inputModalities },
+        ...info === undefined || info.defaultMaxTokens === undefined ? {} : { maxTokens: info.defaultMaxTokens },
+        ...info === undefined || info.reasoning === undefined ? {} : { hasReasoning: true },
         ...price?.input === undefined ? {} : { inputPrice: price.input },
         ...price?.output === undefined ? {} : { outputPrice: price.output },
         ...run.failedRoutes.has(routeKey({ provider: entry.provider, model: id })) ? { sessionFailed: true } : {},
@@ -931,6 +952,36 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
   const tracker = createAgentTracker(ctx, engine.clearAll)
   const { states, sessionAgents, knownAgents, stateFor, stepFor } = tracker
 
+  /** Retire step state for finished turns (turn numbers before `turn`). */
+  function retireFinishedTurns(agentState: AgentState, turn: number): void {
+    if (agentState.lastTurn !== undefined && agentState.lastTurn !== turn) {
+      const retired = `${agentState.lastTurn}/`
+      for (const key of [...agentState.steps.keys()]) {
+        if (key.startsWith(retired)) agentState.steps.delete(key)
+      }
+    }
+  }
+
+  /** Record the primary route on first request and detect a user model switch.
+   * Returns `userSwitched: true` when a fresh primary differs from the previous
+   * step's primary (the plugin never rewrites primaryRoute to a fallback, so a
+   * change there is the user's own selection). */
+  function trackPrimary(
+    agentState: AgentState,
+    state: StepState,
+    resolved: LlmCallConfig,
+  ): { userSwitched: boolean } {
+    const previousPrimary = agentState.primaryRoute
+    const isFreshPrimary = state.primary === undefined
+    if (isFreshPrimary) {
+      state.primary = { provider: resolved.provider, model: resolved.model }
+      agentState.primaryRoute = { provider: resolved.provider, model: resolved.model }
+    }
+    const userSwitched = isFreshPrimary && previousPrimary !== undefined
+      && (previousPrimary.provider !== resolved.provider || previousPrimary.model !== resolved.model)
+    return { userSwitched }
+  }
+
   // Escape-hatch tool: an agent can restore every configured model's usability
   // in one call by discarding all of the plugin's routing decisions.
   const tools = ctx.get('tools') as { register(definition: unknown): () => void } | undefined
@@ -998,31 +1049,15 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
   ctx.on('agent/request', async (payload, next) => {
     const { agent, turn, step, signal } = payload
     const agentState = stateFor(agent)
-    if (agentState.lastTurn !== undefined && agentState.lastTurn !== turn) {
-      const retired = `${agentState.lastTurn}/`
-      for (const key of [...agentState.steps.keys()]) {
-        if (key.startsWith(retired)) {
-          agentState.steps.delete(key)
-        }
-      }
-    }
+    retireFinishedTurns(agentState, turn)
     agentState.lastTurn = turn
     sessionAgents.set(agent.session, agent)
     const state = stepFor(agent, turn, step)
     state.attempts += 1
     const resolved = await next()
-    const previousPrimary = agentState.primaryRoute
-    const isFreshPrimary = state.primary === undefined
-    if (isFreshPrimary) {
-      state.primary = { provider: resolved.provider, model: resolved.model }
-      agentState.primaryRoute = { provider: resolved.provider, model: resolved.model }
-    }
-    // A fresh primary that differs from the previous step's is a user-initiated
-    // model switch (the plugin never rewrites primaryRoute to a fallback, so a
-    // change here reflects the user's own selection change).
-    const userSwitched = isFreshPrimary && previousPrimary !== undefined
-      && (previousPrimary.provider !== resolved.provider || previousPrimary.model !== resolved.model)
+    const { userSwitched } = trackPrimary(agentState, state, resolved)
     knownAgents.add(agent)
+    // A pending route from a prior recovery rewrites the resolved config.
     const pending = state.pendingRoute
     state.pendingRoute = undefined
     if (pending !== undefined) {
@@ -1030,19 +1065,36 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       state.lastRoute = { provider: replaced.provider, model: replaced.model }
       return replaced
     }
-    // Respect a user's explicit model switch: don't force the request back to
-    // the session's healthy fallback route — the new model gets its own fresh
-    // quota re-check below instead of silently being overridden.
+    // Redirect to the session-healthy fallback unless the user just switched.
     const healthy = agentState.healthyRoute
     if (!userSwitched && healthy !== undefined && (healthy.provider !== resolved.provider || healthy.model !== resolved.model)) {
       const redirected = withRoute(resolved, healthy)
       state.lastRoute = { provider: redirected.provider, model: redirected.model }
       return redirected
     }
-    // Preemptive switch when the resolved route's allowance trips a threshold
-    // or cannot cover the projected cost of this request. A user-switched model
-    // is interrogated fresh (force=true) to notice an underfunded selection
-    // rather than trusting a stale cached allowance.
+    // Preemptive quota check: switch before sending if the allowance is
+    // insufficient or unobservable for a user-switched model.
+    const preemptive = await preemptiveQuotaCheck(
+      resolved, agent, agentState, state, turn, step, signal, userSwitched,
+    )
+    if (preemptive !== undefined) return preemptive
+    state.lastRoute = { provider: resolved.provider, model: resolved.model }
+    return resolved
+  })
+
+  /** The preemptive quota gate: checks the resolved route's allowance and
+   * switches (or warns + probes) before the request goes out. Returns the
+   * rewritten config when a switch occurs, or `undefined` to send as-is. */
+  async function preemptiveQuotaCheck(
+    resolved: LlmCallConfig,
+    agent: Agent,
+    agentState: AgentState,
+    state: StepState,
+    turn: number,
+    step: number,
+    signal: AbortSignal,
+    userSwitched: boolean,
+  ): Promise<LlmCallConfig | undefined> {
     const quotaCheck = await checkQuota(resolved.provider, resolved.model, signal, userSwitched)
     const trip = quotaCheck === undefined ? { below: false } : belowThreshold(quotaCheck, quota)
     const projected = estimateCost(quota, resolved.provider, resolved.model, agent.session)
@@ -1078,11 +1130,11 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
         state.chainCursor = cursorIndexOf(result.cursor)
         return withRoute(resolved, result.route)
       }
-    } else if (userSwitched && quotaCheck?.remaining === undefined) {
-      // The user picked a model whose allowance is unobservable (no fresh quota
-      // disclosed). Honor the selection and let this very request act as the
-      // probe: a failure will ban + fall back, and a warning surfaces that the
-      // model was probed with the request itself.
+      return undefined
+    }
+    if (userSwitched && quotaCheck?.remaining === undefined) {
+      // The user picked a model whose allowance is unobservable. Honor the
+      // selection and let this very request act as the probe.
       agent.session.append('llm/quota-warning', {
         turn,
         step,
@@ -1090,12 +1142,10 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
         model: resolved.model,
         reason: 'unobservable' as const,
       })
-      state.lastRoute = { provider: resolved.provider, model: resolved.model }
       return resolved
     }
-    state.lastRoute = { provider: resolved.provider, model: resolved.model }
-    return resolved
-  })
+    return undefined
+  }
 
   // On an eligible failure, resolve the next fallback route (skipping providers
   // with no matching model) and ask the loop to re-derive the request with the
@@ -1149,7 +1199,9 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
   })
 
   // Poll the primary route's allowance so a recovered allowance clears the
-  // session-wide healthy cache in time for the next request.
+  // session-wide healthy cache in time for the next request. Uses force=true
+  // to bypass the TTL cache — the poll is the sole mechanism that notices a
+  // recovered allowance between requests, and a stale cache would defeat it.
   if (config.pollIntervalMs !== undefined && config.pollIntervalMs > 0) {
     const pollAbort = new AbortController()
     const timer = setInterval(async () => {
@@ -1158,7 +1210,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
         if (agentState === undefined || agentState.healthyRoute === undefined) continue
         const primary = agentState.primaryRoute
         if (primary === undefined) continue
-        const check = await checkQuota(primary.provider, primary.model, pollAbort.signal)
+        const check = await checkQuota(primary.provider, primary.model, pollAbort.signal, true)
         if (check === undefined) continue
         if (!belowThreshold(check, quota).below) agentState.healthyRoute = undefined
       }
@@ -1171,7 +1223,14 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
 
   // Promote a fallback switch to the session-wide healthy cache once the
   // switched route completes a model message successfully.
-  ctx.on('internal/dispatch', (_mode, eventName, args) => {
+  //
+  // Assumes Session:Agent is 1:1 (each session is owned by exactly one agent).
+  // If multiple agents share a session, the last one to issue a request wins
+  // the mapping; the guard below (states.get → undefined) prevents a crash
+  // but the healthy promotion may land on the wrong agent.
+  let dispatchSeen = false
+  ctx.on('internal/dispatch', (_mode: string, eventName: string, args: unknown) => {
+    dispatchSeen = true
     if (eventName !== 'session/event') return
     const [session, event] = args as [Session, SessionEvent]
     if (event.type !== 'assistant/message') return
@@ -1184,4 +1243,17 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       agentState.healthyRoute = { provider: source.provider, model: source.model }
     }
   }, { global: true })
+  // If the internal dispatch mechanism is absent (DSH refactor), the healthy
+  // cache is silently disabled. Warn once after 30s so the degradation is
+  // visible without spamming every request.
+  const dispatchProbe = setTimeout(() => {
+    if (!dispatchSeen) {
+      ctx.logger('llm-fallback').warn(
+        'internal/dispatch events not observed after 30s; healthy-route promotion is disabled. ' +
+        'This may indicate a DSH runtime version mismatch.',
+      )
+    }
+  }, 30_000)
+  dispatchProbe.unref?.()
+  ctx.effect(() => () => { clearTimeout(dispatchProbe) }, 'llm-fallback: clear dispatch probe')
 }

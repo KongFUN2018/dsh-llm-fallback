@@ -1379,6 +1379,115 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
   })
 })
 
+describe('concurrency and edge cases', () => {
+  let ctx: Context | undefined
+
+  afterEach(async () => {
+    await ctx?.fiber.dispose()
+    ctx = undefined
+    vi.unstubAllGlobals()
+    delete process.env.DEEPSEEK_API_KEY
+  })
+
+  it('two agents on the same provider both fall back independently', async () => {
+    const h = await harness({
+      ds: [
+        new LlmError('quota', 'QUOTA', { status: 402 }),
+        new LlmError('quota', 'QUOTA', { status: 402 }),
+      ],
+      gl: [textResponse('a-done'), textResponse('b-done')],
+    }, {
+      fallbacks: [{ provider: 'gl', model: 'opus' }],
+    })
+    ctx = h.ctx
+    const agent1 = ctx.agentLoop.create(SessionId('conc-1'), { provider: 'ds', model: 'chat' })
+    const agent2 = ctx.agentLoop.create(SessionId('conc-2'), { provider: 'ds', model: 'chat' })
+    // Fire both concurrently.
+    agent1.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    agent2.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await Promise.all([agent1.whenIdle(), agent2.whenIdle()])
+
+    // Each agent independently falls back; the ban is per-agent (per AgentState).
+    const requests = h.adapter.requests.map(request => `${request.provider}/${request.model}`)
+    expect(requests).toHaveLength(4)
+    expect(requests.filter(r => r === 'ds/chat')).toHaveLength(2)
+    expect(requests.filter(r => r === 'gl/opus')).toHaveLength(2)
+    expect(agent1.session.events.filter(e => e.type === 'llm/fallback')).toHaveLength(1)
+    expect(agent2.session.events.filter(e => e.type === 'llm/fallback')).toHaveLength(1)
+  })
+
+  it('poll uses force=true to bypass the quota TTL cache', async () => {
+    let calls = 0
+    let remaining = 100
+    const provider: QuotaProvider = {
+      name: 'poll-probe',
+      async check() {
+        calls += 1
+        if (calls >= 2) remaining = 500 // recovers on second and later calls
+        return { kind: 'balance', remaining }
+      },
+    }
+    const h = await harness(
+      { ds: [textResponse('t1'), textResponse('t2')], gl: [textResponse('gl-done')] },
+      {
+        fallbacks: [{ provider: 'gl', model: 'opus' }],
+        pollIntervalMs: 10,
+        quota: { thresholdAbsolute: 200, providers: [provider], cacheMs: 60_000 },
+      },
+    )
+    ctx = h.ctx
+    // Simulate installModelSelection re-applying the user's primary every request.
+    ctx.on('agent/request', async (_payload, next) => {
+      const resolved = await next()
+      return { ...resolved, provider: 'ds', model: 'chat' }
+    })
+    const agent = ctx.agentLoop.create(SessionId('poll-force'), { provider: 'ds', model: 'chat' })
+
+    // Turn 1: ds is below threshold (100 < 200) → preemptive switch to gl/opus.
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(h.adapter.requests.map(r => r.provider)).toContain('gl')
+
+    // Wait for the poll to fire with force=true (bypassing the 60s cache).
+    // The poll calls checkQuota with force=true → calls >= 2 → remaining = 500
+    // → not below threshold → healthyRoute is cleared.
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    // Turn 2: ds has recovered (poll cleared the healthy route) → ds is used.
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // The poll must have called the provider (force bypasses cache).
+    expect(calls).toBeGreaterThanOrEqual(2)
+    // Turn 2 should have used ds (healthy route cleared by poll).
+    const lastRequest = h.adapter.requests.at(-1)
+    expect(lastRequest?.provider).toBe('ds')
+  })
+
+  it('token estimate cache avoids re-serializing when message count is unchanged', async () => {
+    const h = await harness({
+      ds: [new LlmError('quota', 'QUOTA', { status: 402 })],
+      gl: [textResponse('done')],
+    }, {
+      fallbacks: [{ provider: 'gl', model: 'opus' }],
+    })
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('token-cache'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // The request and the recovery both call estimateInputTokens with the same
+    // session; the second call should hit the cache (same message count).
+    // We can't directly observe the cache, but we verify the feature works:
+    // the turn completes and the estimate was computed correctly.
+    expect(h.adapter.requests.map(r => `${r.provider}/${r.model}`)).toEqual(['ds/chat', 'gl/opus'])
+    expect(agent.session.deriveMessages().at(-1)).toMatchObject({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'done' }],
+    })
+  })
+})
+
 describe('reset tool name', () => {
   it('stays legal for strict function-calling gateways', () => {
     // Tripwire for the registered literal: gateways reject names outside

@@ -51,7 +51,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && tsdown",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

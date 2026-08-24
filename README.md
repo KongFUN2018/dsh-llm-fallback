@@ -12,6 +12,7 @@ This is a standalone repository (not part of the DeepSeek Harness monorepo). It 
 npm install
 npm run build   # tsc emits lib/types/*.js + .d.ts, then tsdown bundles lib/
 npm test        # 83 vitest tests
+npm run typecheck  # tsc --noEmit (fast type-only check)
 ```
 
 Requirements: Node ≥ 24, npm (or pnpm). Runtime peer dependencies are the DeepSeek Harness packages at `0.1.0-rc.6` (`@deepseek-ai/cordis`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-credentials`, `@deepseek-ai/dsh-invariants`).
