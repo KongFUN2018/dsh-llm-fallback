@@ -31,10 +31,11 @@ npm test        # 83 个 vitest 测试
 
 ## Web 界面提示行
 
-本包内置浏览器端伴生插件（通过包内 `dsh.client` 字段声明），DSH web 外壳在加载节点端的同时会自动加载它。它注册两个会话定义与两个键控聊天渲染器，把持久事件呈现在发生切换的确切位置：
+本包内置浏览器端伴生插件（通过包内 `dsh.client` 字段声明），DSH web 外壳在加载节点端的同时会自动加载它。它注册三个会话定义与三个键控聊天渲染器，把持久事件呈现在发生切换的确切位置：
 
 - **`llm/fallback`** 每次切换渲染一行淡色提示 —— `⇄ 已自动切换模型：ds/chat → gl/haiku · 原因 QUOTA · 还可回退 2 个路由`。
-- **`llm/quota-warning`** 每次提前切换渲染一行 —— `⚠ 额度预警：ds/chat 剩余 10（阈值 20），已提前切换`。
+- **`llm/quota-warning`** 每次提前切换或成本止损渲染一行 —— `⚠ 额度预警：ds/chat 剩余 10（阈值 20），已提前切换`。
+- **`llm/fallback-exhausted`** 回退链耗尽时渲染一行 —— `⛔ 回退链已耗尽：b/m2 第 3 次请求失败（原因 SERVER），已无可用路由`。
 
 输入框的模型座位刻意继续显示你自己的选择：选择表达意图，路由由插件负责。每条回复实际使用的模型仍可在 Trajectory 视图的 provenance 中逐条查看，而这些提示行在会话内标记每一次切换。
 
@@ -85,22 +86,24 @@ npm test        # 83 个 vitest 测试
       prices:
         ds: { input: 0.27, output: 1.10 }
       estimatedOutputTokens: 1024
+      costCap: 5.0
 ```
 
 `fallbacks` 是有序回退链。带 `model` 的路由使用该确切模型；省略 `model` 的路由在其供应商内部按能力匹配选择。`codes` 是可切换失败码，`unusableCodes` 推进链但不禁选，`cooldownMs: 0` 表示会话内永久冷却瞬时失败。`pollIntervalMs` 定时复查主路由额度，额度恢复后在下一次请求前清除会话内健康缓存。`preference` 在同一供应商内多个能力对等候选之间打破平局：`closest`（默认，上下文窗口最接近）、`price`（非降级窗口最小）、`speed`（输出上限最小）、`reasoning`（优先暴露推理档位的模型）。
 
 额度查询按优先级依次解析：`static`（最高）→ `providers`（代码级可插拔查询源）→ `queryers`（声明式 HTTP 端点，响应采用 DeepSeek `/user/balance` 的 `{ is_available, balance_infos: [{ total_balance }] }` 形态）→ 内置 `deepseek` 源（DeepSeek `/user/balance` 端点，API key 经 `ctx.credentials` 或启动环境解析）。查询结果按 `cacheMs` 缓存并做单飞去重；任何查询失败都解析为「不可观测」，绝不阻塞请求。
 
-`thresholdAbsolute` 与 `thresholdRatio`（剩余/总量）触发主动切换。当 `prices` 为某路由配置每百万 token 单价时，单次消耗预估（序列化会话估算的输入 token 数 + `estimatedOutputTokens`）也会在已披露的 `remaining` 不足以覆盖时触发切换；此时 `llm/quota-warning` 事件记录 `estimatedCost`、`inputPrice`、`outputPrice`。
+`thresholdAbsolute` 与 `thresholdRatio`（剩余/总量）触发主动切换。当 `prices` 为某路由配置每百万 token 单价时，单次消耗预估（序列化会话估算的输入 token 数 + `estimatedOutputTokens`）也会在已披露的 `remaining` 不足以覆盖时触发切换；此时 `llm/quota-warning` 事件记录 `estimatedCost`、`inputPrice`、`outputPrice`。`costCap` 设定一个实例级累计预估成本预算：当插件累计的单次请求预估成本达到该上限，停止切换（让真实失败接管），并记录一条 reason 为 `cost-cap-reached` 的 `llm/quota-warning`。
 
 ## 事件
 
-两类事件均为非表面事件，类型定义在浏览器安全的 `@kongfun2018/dsh-llm-fallback/types` 子路径中，远程渲染端无需加载运行时即可读取持久状态。
+三类事件均为非表面事件，类型定义在浏览器安全的 `@kongfun2018/dsh-llm-fallback/types` 子路径中，远程渲染端无需加载运行时即可读取持久状态。
 
 - `llm/fallback` —— 切换前记录：`{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`。`remaining` 数的是选中路由所在及之后的**链上位置数**，而非"确定可用的候选数"（策略/LLM 决策选择下，部分位置可能已被禁选或不满足地板）；且除非所选路由就是最后一条，否则它计入本次的 `remaining`。
-- `llm/quota-warning` —— 请求前检查触发阈值、消耗预估，或用户切换模型后额度不可观测时记录：`{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, reason }`，`reason` 为 `below-threshold`、`insufficient-cost` 或 `unobservable`。
+- `llm/quota-warning` —— 请求前检查触发阈值、消耗预估、累计成本达上限（止损），或用户切换模型后额度不可观测时记录：`{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, costCap?, cumulativeCost?, reason }`，`reason` 为 `below-threshold`、`insufficient-cost`、`cost-cap-reached` 或 `unobservable`。
+- `llm/fallback-exhausted` —— 合格失败且无回退候选（链条耗尽）时记录：`{ turn, step, provider, model, code, attempts }`，命名最后失败的路由与该步总请求数。
 
-单独发布的 `./invariant` 伴随件校验每条记录都指向当前打开的 turn/step、标识非空、数值字段非负、`llm/fallback` 的 from/to 不同路由、`llm/quota-warning` 的 reason 合法。
+单独发布的 `./invariant` 伴随件校验每条记录都指向当前打开的 turn/step、标识非空、数值字段非负、`llm/fallback` 的 from/to 不同路由、`llm/fallback-exhausted` 的 `attempts ≥ 1`、`llm/quota-warning` 的 reason 合法。
 
 ## 已知限制与待办
 

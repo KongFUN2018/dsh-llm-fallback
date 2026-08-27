@@ -9,7 +9,7 @@
  * @module @kongfun2018/dsh-llm-fallback/client/views
  */
 import type { CSSProperties } from 'react'
-import type { FallbackChatData, QuotaWarningChatData } from './nodes.ts'
+import type { FallbackChatData, QuotaWarningChatData, FallbackExhaustedChatData } from './nodes.ts'
 import { strategyDetailParts } from './nodes.ts'
 import { fbT } from './translate.ts'
 
@@ -81,6 +81,14 @@ export function FallbackNodeView({ node }: { node: { readonly data: FallbackChat
  * forged payloads. */
 function warningText(data: QuotaWarningChatData): string {
   switch (data.reason) {
+    case 'cost-cap-reached':
+      return data.costCap !== undefined && data.cumulativeCost !== undefined
+        ? fbT('warning.costCapReached', {
+            route: data.route,
+            cumulative: String(data.cumulativeCost),
+            cap: String(data.costCap),
+          })
+        : fbT('warning.costCapReachedUnknown', { route: data.route })
     case 'unobservable':
       return fbT('warning.unobservableProbe', { route: data.route })
     case 'insufficient-cost':
@@ -107,6 +115,19 @@ export function QuotaWarningNodeView({ node }: { node: { readonly data: QuotaWar
         <span style={iconStyle} aria-hidden>⚠</span>
         <span>{warningText(data)}</span>
         {strategyDetail(data.mode, undefined)}
+      </div>
+    </div>
+  )
+}
+
+/** Keyed chat renderer for one exhausted-fallback-chain notice. */
+export function FallbackExhaustedNodeView({ node }: { node: { readonly data: FallbackExhaustedChatData } }) {
+  const data = node.data
+  return (
+    <div style={rowStyle} data-dsh-llm-fallback="fallback-exhausted">
+      <div style={lineStyle}>
+        <span style={iconStyle} aria-hidden>⛔</span>
+        <span>{fbT('exhausted.message', { route: data.route, attempts: String(data.attempts), code: data.code })}</span>
       </div>
     </div>
   )

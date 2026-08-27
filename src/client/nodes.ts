@@ -16,7 +16,7 @@ import type {
 // Type-only: the ChatNodeDataMap merge target (erased before bundling).
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
-import type { LlmFallbackEventData, LlmQuotaWarningEventData } from '../types.ts'
+import type { LlmFallbackEventData, LlmQuotaWarningEventData, LlmFallbackExhaustedEventData } from '../types.ts'
 import { fbT } from './translate.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
@@ -25,6 +25,8 @@ declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
     'llm-fallback': FallbackChatData
     /** One preemptive quota-warning switch notice row. */
     'llm-quota-warning': QuotaWarningChatData
+    /** One exhausted-fallback-chain notice row. */
+    'llm-fallback-exhausted': FallbackExhaustedChatData
   }
 }
 
@@ -61,9 +63,24 @@ export interface QuotaWarningChatData {
   readonly total?: number
   readonly threshold?: number
   readonly estimatedCost?: number
-  readonly reason: 'below-threshold' | 'insufficient-cost' | 'unobservable'
+  readonly reason: 'below-threshold' | 'insufficient-cost' | 'cost-cap-reached' | 'unobservable'
+  /** The configured cumulative-cost cap that was reached (for cost-cap-reached). */
+  readonly costCap?: number
+  /** The accumulated projected cost at the time the cap was reached. */
+  readonly cumulativeCost?: number
   /** Strategy mode that selected the target, when a strategy was active. */
   readonly mode?: 'cost' | 'performance' | 'closest'
+}
+
+/** Chat payload of one llm/fallback-exhausted event. */
+export interface FallbackExhaustedChatData {
+  readonly seq: number
+  readonly time: number
+  /** Route of the last failing request, as "provider/model". */
+  readonly route: string
+  readonly code: string
+  /** Total requests issued in the exhausted step, including the final failure. */
+  readonly attempts: number
 }
 
 /** A finite non-negative integer read from an untrusted payload field. */
@@ -123,13 +140,16 @@ function warningOf(event: SessionEvent): LlmQuotaWarningEventData | undefined {
   if (turn === undefined || step === undefined || provider === undefined || model === undefined) {
     return undefined
   }
-  if (data.reason !== 'below-threshold' && data.reason !== 'insufficient-cost' && data.reason !== 'unobservable') return undefined
+  if (data.reason !== 'below-threshold' && data.reason !== 'insufficient-cost'
+    && data.reason !== 'cost-cap-reached' && data.reason !== 'unobservable') return undefined
   const remaining = count(data.remaining)
   const total = count(data.total)
   const threshold = count(data.threshold)
   const estimatedCost = count(data.estimatedCost)
   const inputPrice = count(data.inputPrice)
   const outputPrice = count(data.outputPrice)
+  const costCap = count(data.costCap)
+  const cumulativeCost = count(data.cumulativeCost)
   const mode = strategyMode(data.mode)
   return {
     turn, step, provider, model, reason: data.reason,
@@ -139,8 +159,28 @@ function warningOf(event: SessionEvent): LlmQuotaWarningEventData | undefined {
     ...(estimatedCost !== undefined ? { estimatedCost } : {}),
     ...(inputPrice !== undefined ? { inputPrice } : {}),
     ...(outputPrice !== undefined ? { outputPrice } : {}),
+    ...(costCap !== undefined ? { costCap } : {}),
+    ...(cumulativeCost !== undefined ? { cumulativeCost } : {}),
     ...(mode !== undefined ? { mode } : {}),
   }
+}
+
+/** Structurally narrow one llm/fallback-exhausted event payload. */
+function exhaustedOf(event: SessionEvent): LlmFallbackExhaustedEventData | undefined {
+  if (event.type !== 'llm/fallback-exhausted') return undefined
+  const data = event.data as Partial<LlmFallbackExhaustedEventData> | undefined
+  if (data === undefined) return undefined
+  const turn = count(data.turn)
+  const step = count(data.step)
+  const provider = label(data.provider)
+  const model = label(data.model)
+  const code = label(data.code)
+  const attempts = count(data.attempts)
+  if (turn === undefined || step === undefined || provider === undefined
+    || model === undefined || code === undefined || attempts === undefined || attempts < 1) {
+    return undefined
+  }
+  return { turn, step, provider, model, code, attempts }
 }
 
 /** Best currently loaded event Location of one Context. */
@@ -239,6 +279,43 @@ export const quotaWarningNodeDefinition: ConversationNodeDefinition<QuotaWarning
     return {
       key: context.key,
       kind: 'llm-quota-warning',
+      id: context.id,
+      target: 'chat',
+      anchorSeq: context.state.seq,
+      location: contextLocation(context),
+      visibility: 'visible',
+      data: context.state,
+    } satisfies ChatConversationViewNode
+  },
+}
+
+/** Definition for the durable llm/fallback-exhausted notice. */
+export const fallbackExhaustedNodeDefinition: ConversationNodeDefinition<FallbackExhaustedChatData> = {
+  kind: 'llm-fallback-exhausted',
+  target: 'chat',
+  match: (event) => {
+    const payload = exhaustedOf(event)
+    return payload === undefined ? null : { id: `llm-fallback-exhausted:${event.seq}`, role: 'start' }
+  },
+  start: (_context, match) => {
+    const payload = exhaustedOf(match.event)
+    if (payload === undefined) {
+      throw new Error('llm-fallback-exhausted start requires a valid llm/fallback-exhausted event')
+    }
+    return {
+      seq: match.event.seq,
+      time: match.event.time,
+      route: `${payload.provider}/${payload.model}`,
+      code: payload.code,
+      attempts: payload.attempts,
+    }
+  },
+  update: context => context.state,
+  buildViewNode: (context) => {
+    if (context.state === undefined) return null
+    return {
+      key: context.key,
+      kind: 'llm-fallback-exhausted',
       id: context.id,
       target: 'chat',
       anchorSeq: context.state.seq,

@@ -89,14 +89,23 @@ The plugin promotes a switched route to `healthyRoute` only after it completes a
 
 Ban duration is quota-kind-aware: a recharge `balance` at zero bans permanently; a resetting `quota` bans until `resetAt`; transient failures cool down for `cooldownMs` (`0` = session ban). Structural `unusableCodes` (`NO_ADAPTER`, `UNSUPPORTED_REASONING_EFFORT`, …) advance the chain **without** banning.
 
-### Two durable events
+### Three durable events
 
-Both are appended to the session event stream and typed via `declare module '@deepseek-ai/dsh-session/types'` augmentation in `src/types.ts`:
+All are appended to the session event stream and typed via `declare module '@deepseek-ai/dsh-session/types'` augmentation in `src/types.ts`:
 
 - `llm/fallback` — recorded immediately before switching: from/to route, code, remaining chain positions.
-- `llm/quota-warning` — recorded on a preemptive switch: route, remaining/threshold/estimated cost, and a `reason` of `below-threshold` | `insufficient-cost` | `unobservable`.
+- `llm/quota-warning` — recorded on a preemptive switch or stop-loss: route, remaining/threshold/estimated cost, and a `reason` of `below-threshold` | `insufficient-cost` | `cost-cap-reached` | `unobservable`.
+- `llm/fallback-exhausted` — recorded when an eligible failure finds no fallback candidate (the chain is out): the last failed route, its code, and the step's `attempts` count.
 
-The browser half (`src/client/`) only **renders** what the node half recorded — it does no routing. It registers two Conversation Definitions + two keyed chat renderers (`FallbackNodeView`, `QuotaWarningNodeView`) so each switch shows as a muted notice row exactly where it happened in the conversation. The composer's model seat deliberately keeps showing the user's own selection (selection is intent; routing is the plugin's job).
+The browser half (`src/client/`) only **renders** what the node half recorded — it does no routing. It registers three Conversation Definitions + three keyed chat renderers (`FallbackNodeView`, `QuotaWarningNodeView`, `FallbackExhaustedNodeView`) so each event shows as a muted notice row exactly where it happened in the conversation. The composer's model seat deliberately keeps showing the user's own selection (selection is intent; routing is the plugin's job).
+
+### Diagnostics: `getFallbackStats`
+
+`getFallbackStats(ctx)` returns `{ agents, steps, switches, switchSuccess, exhaustions }` — the instance's routing health: how many switches went out, how many completed successfully, and how many steps exhausted the chain. It is the product-level reliability seam (the "is fallback actually working" answer); read it through the same `WeakMap` registry as reset.
+
+### Cost-cap stop-loss
+
+`Config.quota.costCap` sets an instance-wide cumulative projected-cost budget. `apply()` holds a `cumulativeCost` accumulator charged on every request that actually goes out (`agent/request`'s three return paths). In `agent/request-error`, once `cumulativeCost >= costCap`, the plugin stops switching (`return next()`) and records a `cost-cap-reached` `llm/quota-warning`. `resetFallback` zeroes the accumulator via the tracker's `onReset` callback.
 
 ### Reset escape hatch
 
@@ -104,14 +113,14 @@ The browser half (`src/client/`) only **renders** what the node half recorded �
 
 ### The invariant companion
 
-`src/invariant.ts` is a **separate Cordis plugin** (`name: 'llm-fallback-invariant'`, `inject: ['invariants']`) published as `./invariant`. It validates that every `llm/fallback` and `llm/quota-warning` record names the currently open turn/step, carries non-empty identifiers and non-negative numeric fields, switches to a different route, and uses a known reason. It runs on loaded sessions, on session creation, and on every appended event. Keep it as a companion — the node plugin and the invariant are independently registered.
+`src/invariant.ts` is a **separate Cordis plugin** (`name: 'llm-fallback-invariant'`, `inject: ['invariants']`) published as `./invariant`. It validates that every `llm/fallback`, `llm/quota-warning`, and `llm/fallback-exhausted` record names the currently open turn/step, carries non-empty identifiers and non-negative numeric fields, switches to a different route, and uses a known reason. It runs on loaded sessions, on session creation, and on every appended event. Keep it as a companion — the node plugin and the invariant are independently registered.
 
 ## Testing conventions
 
-Tests live in `tests/` (3 files, 83 tests) and use a real Cordis context, not mocks. `tests/fallback.spec.ts` exports a `harness()` helper that wires `LlmRuntime`, `SessionStore`, `SystemPrompt`, `ToolRuntime`, `CommandRuntime`, `AgentRegistry`, `AgentLoop`, then the fallback plugin, against a `ScriptedAdapter` that serves scripted `StreamChunk` sequences (or `LlmError`s) per provider and records every `GenerateOptions` call. Tests typically assert on two things:
+Tests live in `tests/` (4 files, 97 tests) and use a real Cordis context, not mocks. `tests/fallback.spec.ts` exports a `harness()` helper that wires `LlmRuntime`, `SessionStore`, `SystemPrompt`, `ToolRuntime`, `CommandRuntime`, `AgentRegistry`, `AgentLoop`, then the fallback plugin, against a `ScriptedAdapter` that serves scripted `StreamChunk` sequences (or `LlmError`s) per provider and records every `GenerateOptions` call. Tests typically assert on two things:
 
 - `h.adapter.requests.map(r => `${r.provider}/${r.model}`)` — the exact sequence of provider/model calls the loop actually issued.
-- `agent.session.events.filter(e => e.type === 'llm/fallback' | 'llm/quota-warning')` — the durable records the plugin appended.
+- `agent.session.events.filter(e => e.type === 'llm/fallback' | 'llm/quota-warning' | 'llm/fallback-exhausted')` — the durable records the plugin appended.
 
 `tests/strategy.spec.ts` splits between a `strategy pure layer` describe (calls `selectByStrategy` etc. directly) and an `llm-fallback strategy integration` describe (goes through `harness`). When adding strategy logic, add a pure-layer test first — it is far cheaper than an integration one.
 
@@ -120,3 +129,7 @@ Each `describe` owns its own `ctx` and disposes it in `afterEach` (`ctx?.fiber.d
 ## Configuration reference
 
 See `README.md` §Configuration for the full YAML shape and `docs/strategy-design.md` for the strategy design (floor F1–F4, cost/performance scoring, escalation ladder, the §十三 chat-notice rendering). When changing config schema, update both `Config` (the `z.object` in `src/index.ts`) and the `Config` interface above it — they must stay in sync.
+
+**Schemastery fills absent arrays/dicts/objects with `[]`/`{}`/default-filled objects** when the loader validates config (`Config['~standard'].validate`). An absent `codes` arrives in `apply()` as `[]`, which is not nullish, so `config.codes ?? DEFAULT_*` does NOT fall back — the field must carry its real default in the schema (`.default([...])`). This once disabled all reactive switching in production while direct-`apply()` tests stayed green (see the `config schema` describe in tests/fallback.spec.ts). Any new optional array/dict config field needs its intended default in the schema, and a schema-validated test if apply() branches on it.
+
+`scripts/verify-real-wiring.mjs` (not in `npm test`) runs the shipped `lib/` build inside the locally installed production dsh runtime tree with a mock gateway, covering the seams the vitest harness cannot (real HTTP → pi-ai classification → retry/fallback waterfall order). Requires the global `dsh` install; run it before deploying to the profile.

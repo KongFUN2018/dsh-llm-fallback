@@ -16,6 +16,8 @@ declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
         'llm-fallback': FallbackChatData;
         /** One preemptive quota-warning switch notice row. */
         'llm-quota-warning': QuotaWarningChatData;
+        /** One exhausted-fallback-chain notice row. */
+        'llm-fallback-exhausted': FallbackExhaustedChatData;
     }
 }
 /** One fallback switch as the chat row renders it. */
@@ -49,9 +51,23 @@ export interface QuotaWarningChatData {
     readonly total?: number;
     readonly threshold?: number;
     readonly estimatedCost?: number;
-    readonly reason: 'below-threshold' | 'insufficient-cost' | 'unobservable';
+    readonly reason: 'below-threshold' | 'insufficient-cost' | 'cost-cap-reached' | 'unobservable';
+    /** The configured cumulative-cost cap that was reached (for cost-cap-reached). */
+    readonly costCap?: number;
+    /** The accumulated projected cost at the time the cap was reached. */
+    readonly cumulativeCost?: number;
     /** Strategy mode that selected the target, when a strategy was active. */
     readonly mode?: 'cost' | 'performance' | 'closest';
+}
+/** Chat payload of one llm/fallback-exhausted event. */
+export interface FallbackExhaustedChatData {
+    readonly seq: number;
+    readonly time: number;
+    /** Route of the last failing request, as "provider/model". */
+    readonly route: string;
+    readonly code: string;
+    /** Total requests issued in the exhausted step, including the final failure. */
+    readonly attempts: number;
 }
 /** One mode for strategy-detail rendering. */
 export type StrategyModeDisplay = 'cost' | 'performance' | 'closest';
@@ -65,4 +81,6 @@ export declare function strategyDetailParts(mode: StrategyModeDisplay | undefine
 export declare const fallbackNodeDefinition: ConversationNodeDefinition<FallbackChatData>;
 /** Definition for the durable llm/quota-warning preemptive-switch notice. */
 export declare const quotaWarningNodeDefinition: ConversationNodeDefinition<QuotaWarningChatData>;
+/** Definition for the durable llm/fallback-exhausted notice. */
+export declare const fallbackExhaustedNodeDefinition: ConversationNodeDefinition<FallbackExhaustedChatData>;
 //# sourceMappingURL=nodes.d.ts.map

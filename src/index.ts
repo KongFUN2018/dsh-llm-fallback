@@ -43,6 +43,12 @@ export const inject = ['agents', 'llm']
 interface FallbackStats {
   agents: number
   steps: number
+  /** Total `llm/fallback` switch events issued (one per switch that went out). */
+  switches: number
+  /** Switched routes that completed a model message successfully (success count). */
+  switchSuccess: number
+  /** Eligible failures where no fallback candidate remained (chain exhausted). */
+  exhaustions: number
 }
 
 /** Per-apply stats handles, keyed by the plugin context (test/diagnostics seam). */
@@ -153,6 +159,10 @@ export interface Config {
     prices?: Record<string, { input?: number; output?: number }>
     /** Estimated output tokens per request for cost projection (default 1024). */
     estimatedOutputTokens?: number
+    /** Cumulative projected-cost cap (in the provider's unit): once the plugin's
+     * accumulated projected cost reaches it, it stops switching and records a
+     * `cost-cap-reached` warning, letting the real failure take over. */
+    costCap?: number
   }
 }
 
@@ -162,15 +172,18 @@ export const Config: z<Config> = z.object({
     model: z.string().min(1),
     reasoningEffort: z.string().min(1),
   })).required(),
-  codes: z.array(z.string().min(1)),
-  unusableCodes: z.array(z.string().min(1)),
+  // schemastery materializes absent arrays as [] — without .default() that
+  // empty array survives `config.codes ?? DEFAULT_*` ([] is not nullish) and
+  // silently disables every eligible/unusable code. Defaults must live here.
+  codes: z.array(z.string().min(1)).default([...DEFAULT_FALLBACK_CODES]),
+  unusableCodes: z.array(z.string().min(1)).default([...DEFAULT_UNUSABLE_CODES]),
   cooldownMs: z.number().min(0).default(60_000),
   pollIntervalMs: z.number().min(1),
   allowDegrade: z.boolean().default(false),
   allowUnknownCapacity: z.boolean().default(false),
   preference: z.union(['closest', 'price', 'speed', 'reasoning']).default('closest'),
   strategy: z.object({
-    mode: z.union(['cost', 'performance', 'closest']).required(),
+    mode: z.union(['cost', 'performance', 'closest']).default('closest'),
     floor: z.object({
       marginTokens: z.number().min(1).default(8192),
     }),
@@ -180,7 +193,7 @@ export const Config: z<Config> = z.object({
       cliffPenalty: z.number().min(1).default(1.5),
     }),
     performance: z.object({
-      axes: z.array(z.union(['reasoning', 'context', 'output'])),
+      axes: z.array(z.union(['reasoning', 'context', 'output'])).default(['reasoning', 'context', 'output']),
       significantRatio: z.number().min(1).default(1.5),
     }),
     escalation: z.object({
@@ -212,6 +225,7 @@ export const Config: z<Config> = z.object({
       output: z.number().min(0),
     })),
     estimatedOutputTokens: z.number().min(1),
+    costCap: z.number().min(0),
   }),
 })
 
@@ -266,6 +280,12 @@ interface AgentState {
   lastTurn: number | undefined
   /** The agent's primary route, recorded on first request (poll re-check target). */
   primaryRoute: Route | undefined
+  /** Total switch events issued for this agent (diagnostics). */
+  switches: number
+  /** Switched routes that completed a model message successfully (diagnostics). */
+  switchSuccess: number
+  /** Eligible failures with no fallback candidate remaining (diagnostics). */
+  exhaustions: number
 }
 
 function stepKey(turn: number, step: number): string {
@@ -808,17 +828,25 @@ interface AgentTracker {
 
 /** Build the agent tracker and register its stats/reset faces plus the
  * `agent/disposed` strong-reference cleanup on the given context. */
-function createAgentTracker(ctx: Context, clearQuota: () => void): AgentTracker {
+function createAgentTracker(ctx: Context, clearQuota: () => void, onReset?: () => void): AgentTracker {
   const states = new WeakMap<Agent, AgentState>()
   const sessionAgents = new WeakMap<Session, Agent>()
   const knownAgents = new Set<Agent>()
-  const stats = (): { agents: number; steps: number } => {
+  const stats = (): { agents: number; steps: number; switches: number; switchSuccess: number; exhaustions: number } => {
     let steps = 0
+    let switches = 0
+    let switchSuccess = 0
+    let exhaustions = 0
     for (const agent of knownAgents) {
       const agentState = states.get(agent)
-      if (agentState !== undefined) steps += agentState.steps.size
+      if (agentState !== undefined) {
+        steps += agentState.steps.size
+        switches += agentState.switches
+        switchSuccess += agentState.switchSuccess
+        exhaustions += agentState.exhaustions
+      }
     }
-    return { agents: knownAgents.size, steps }
+    return { agents: knownAgents.size, steps, switches, switchSuccess, exhaustions }
   }
   fallbackStatsRegistry.set(ctx, stats)
   // Drop a disposed agent's strong reference so the set tracks live agents only
@@ -842,9 +870,14 @@ function createAgentTracker(ctx: Context, clearQuota: () => void): AgentTracker 
       agentState.steps.clear()
       agentState.healthyRoute = undefined
       agentState.switchedKeys.clear()
+      agentState.switches = 0
+      agentState.switchSuccess = 0
+      agentState.exhaustions = 0
     }
-    // Also drop cached/in-flight allowances so the next request re-interrogates.
+    // Also drop cached/in-flight allowances so the next request re-interrogates,
+    // and reset the instance-wide cost-cap accumulator.
     clearQuota()
+    onReset?.()
     return {
       resetAgents: knownAgents.size,
       clearedBans,
@@ -856,7 +889,7 @@ function createAgentTracker(ctx: Context, clearQuota: () => void): AgentTracker 
   const stateFor = (agent: Agent): AgentState => {
     let state = states.get(agent)
     if (state === undefined) {
-      state = { steps: new Map(), healthyRoute: undefined, switchedKeys: new Set(), bannedUntil: new Map(), failedRoutes: new Set(), lastTurn: undefined, primaryRoute: undefined }
+      state = { steps: new Map(), healthyRoute: undefined, switchedKeys: new Set(), bannedUntil: new Map(), failedRoutes: new Set(), lastTurn: undefined, primaryRoute: undefined, switches: 0, switchSuccess: 0, exhaustions: 0 }
       states.set(agent, state)
     }
     return state
@@ -904,6 +937,11 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
   const unusableCodes = new Set(config.unusableCodes ?? DEFAULT_UNUSABLE_CODES)
   const cooldownMs = config.cooldownMs ?? 60_000
   const quota = config.quota
+  // Cumulative projected-cost accumulator for the cost cap (instance-wide budget,
+  // not per-agent). The cap is a stop-loss: once reached, the plugin stops
+  // switching and lets the real failure take over.
+  let cumulativeCost = 0
+  const costCap = quota?.costCap
 
   const engine = createQuotaEngine(ctx, quota)
   const { checkQuota } = engine
@@ -949,7 +987,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     checkQuota,
     signal,
   }
-  const tracker = createAgentTracker(ctx, engine.clearAll)
+  const tracker = createAgentTracker(ctx, engine.clearAll, () => { cumulativeCost = 0 })
   const { states, sessionAgents, knownAgents, stateFor, stepFor } = tracker
 
   /** Retire step state for finished turns (turn numbers before `turn`). */
@@ -1057,12 +1095,19 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     const resolved = await next()
     const { userSwitched } = trackPrimary(agentState, state, resolved)
     knownAgents.add(agent)
+    // Charge the projected cost of one request that actually goes out. The cost
+    // cap is an instance-wide stop-loss budget, so the accumulator is per-apply.
+    const chargeCost = (route: LlmCallConfig): void => {
+      const projected = estimateCost(quota, route.provider, route.model, agent.session)
+      if (projected !== undefined) cumulativeCost += projected.cost
+    }
     // A pending route from a prior recovery rewrites the resolved config.
     const pending = state.pendingRoute
     state.pendingRoute = undefined
     if (pending !== undefined) {
       const replaced = withRoute(resolved, pending)
       state.lastRoute = { provider: replaced.provider, model: replaced.model }
+      chargeCost(replaced)
       return replaced
     }
     // Redirect to the session-healthy fallback unless the user just switched.
@@ -1070,6 +1115,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     if (!userSwitched && healthy !== undefined && (healthy.provider !== resolved.provider || healthy.model !== resolved.model)) {
       const redirected = withRoute(resolved, healthy)
       state.lastRoute = { provider: redirected.provider, model: redirected.model }
+      chargeCost(redirected)
       return redirected
     }
     // Preemptive quota check: switch before sending if the allowance is
@@ -1077,8 +1123,12 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     const preemptive = await preemptiveQuotaCheck(
       resolved, agent, agentState, state, turn, step, signal, userSwitched,
     )
-    if (preemptive !== undefined) return preemptive
+    if (preemptive !== undefined) {
+      chargeCost(preemptive)
+      return preemptive
+    }
     state.lastRoute = { provider: resolved.provider, model: resolved.model }
+    chargeCost(resolved)
     return resolved
   })
 
@@ -1168,6 +1218,23 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     // Escalation ladder: cost-mode candidate failures escalate this step to
     // performance mode — task completion outranks the cost preference.
     if (eligible && state.selectedMode === 'cost') state.strategyFailures += 1
+    // Cost-cap stop-loss: once the instance's accumulated projected cost reaches
+    // the configured cap, the plugin stops switching and lets the real failure
+    // take over, recording why it stopped.
+    if (costCap !== undefined && cumulativeCost >= costCap) {
+      if (eligible) {
+        agent.session.append('llm/quota-warning', {
+          turn,
+          step,
+          provider: from.provider,
+          model: from.model,
+          reason: 'cost-cap-reached',
+          costCap,
+          cumulativeCost,
+        })
+      }
+      return next()
+    }
     const effectiveMode: Exclude<StrategyMode, 'closest'> | undefined = strategySettings === undefined
       ? undefined
       : strategySettings.mode === 'cost' && state.strategyFailures >= escalationAfter
@@ -1178,11 +1245,30 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
       catalog, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(),
       strategyRun(effectiveMode, agent.session, agentState.failedRoutes, checkQuota, signal),
     )
-    if (result === undefined) return next()
+    if (result === undefined) {
+      // The chain is exhausted for this step: no candidate remains. Count it only
+      // for a genuine (eligible) failure — a structural (unusable) code advancing
+      // to the end is a config gap, not a reliability event.
+      if (eligible) {
+        agentState.exhaustions += 1
+        // Give the user an explainable terminal notice: every fallback route was
+        // tried and failed, so the turn ends in an error with no candidate left.
+        agent.session.append('llm/fallback-exhausted', {
+          turn,
+          step,
+          provider: from.provider,
+          model: from.model,
+          code: failure.code,
+          attempts: state.attempts,
+        })
+      }
+      return next()
+    }
     agentState.switchedKeys.add(routeKey(result.route))
     state.pendingRoute = result.route
     state.chainCursor = cursorIndexOf(result.cursor)
     state.selectedMode = result.mode
+    agentState.switches += 1
     agent.session.append('llm/fallback', {
       turn,
       step,
@@ -1241,6 +1327,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     const source = event.data.message.source
     if (agentState.switchedKeys.has(routeKey(source))) {
       agentState.healthyRoute = { provider: source.provider, model: source.model }
+      agentState.switchSuccess += 1
     }
   }, { global: true })
   // If the internal dispatch mechanism is absent (DSH refactor), the healthy

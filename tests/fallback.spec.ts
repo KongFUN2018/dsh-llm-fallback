@@ -115,7 +115,7 @@ async function harness(
   catalog: Record<string, ModelSpec[]> = {},
   retryOptions: { policies?: Record<string, RetryPolicyConfig | undefined>; internals?: retry.RetryInternals } = {},
   beforeFallback?: (ctx: Context) => void,
-): Promise<{ ctx: Context; adapter: ScriptedAdapter; fallbackFiber: ReturnType<Context['plugin']>; stats: () => { agents: number; steps: number } | undefined; reset: () => fallback.ResetSummary | undefined; runCommand: (agent: Parameters<CommandRuntime['execute']>[0], line: string) => Promise<CommandExecution | undefined> }> {
+): Promise<{ ctx: Context; adapter: ScriptedAdapter; fallbackFiber: ReturnType<Context['plugin']>; stats: () => { agents: number; steps: number; switches: number; switchSuccess: number; exhaustions: number } | undefined; reset: () => fallback.ResetSummary | undefined; runCommand: (agent: Parameters<CommandRuntime['execute']>[0], line: string) => Promise<CommandExecution | undefined> }> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
@@ -1025,9 +1025,8 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
     }, { fallbacks: [{ provider: 'gl', model: 'opus' }] })
     ctx = h.ctx
     const agent = ctx.agentLoop.create(SessionId('retire'), { provider: 'ds', model: 'chat' })
-    const stats = (): { agents: number; steps: number } =>
-      h.stats() ?? { agents: 0, steps: 0 }
-
+    const stats = () =>
+      h.stats() ?? { agents: 0, steps: 0, switches: 0, switchSuccess: 0, exhaustions: 0 }
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
     await agent.whenIdle()
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
@@ -1037,6 +1036,123 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
 
     expect(stats().agents).toBe(1)
     expect(stats().steps).toBeLessThanOrEqual(1)
+  })
+
+  it('P0.1 counts a successful switch (switches + switchSuccess)', async () => {
+    const h = await harness({
+      ds: [new LlmError('quota', 'QUOTA', { status: 402 })],
+      gl: [textResponse('done')],
+    }, { fallbacks: [{ provider: 'gl', model: 'opus' }] })
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('p0-success'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    const s = h.stats()!
+    // One switch went out, and the switched route completed a model message.
+    expect(s.switches).toBe(1)
+    expect(s.switchSuccess).toBe(1)
+    expect(s.exhaustions).toBe(0)
+  })
+
+  it('P0.2 counts an exhausted chain (exhaustions) and not a successful switch', async () => {
+    const h = await harness({
+      ds: [new LlmError('quota', 'QUOTA', { status: 402 })],
+      a: [new LlmError('rate', 'RATE_LIMIT', { status: 429 })],
+      b: [new LlmError('down', 'SERVER', { status: 500 })],
+    }, {
+      fallbacks: [
+        { provider: 'a', model: 'm1' },
+        { provider: 'b', model: 'm2' },
+      ],
+    })
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('p0-exhaust'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    const s = h.stats()!
+    // Two switches were issued (ds→a, a→b) but none completed; the final
+    // eligible failure found no candidate, so it is counted as one exhaustion.
+    expect(s.switches).toBe(2)
+    expect(s.switchSuccess).toBe(0)
+    expect(s.exhaustions).toBe(1)
+  })
+
+  it('P1.1 records a fallback-exhausted event naming the last failed route', async () => {
+    const h = await harness({
+      ds: [new LlmError('quota', 'QUOTA', { status: 402 })],
+      a: [new LlmError('rate', 'RATE_LIMIT', { status: 429 })],
+      b: [new LlmError('down', 'SERVER', { status: 500 })],
+    }, {
+      fallbacks: [
+        { provider: 'a', model: 'm1' },
+        { provider: 'b', model: 'm2' },
+      ],
+    })
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('p1-exhaust'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // The turn ends in an error, and exactly one exhausted notice is recorded
+    // naming the last failed route (b/m2) with the step's attempt count (3).
+    const exhausted = agent.session.events.filter(event => event.type === 'llm/fallback-exhausted')
+    expect(exhausted).toHaveLength(1)
+    expect(exhausted[0]!.data).toEqual({
+      turn: 1,
+      step: 1,
+      provider: 'b',
+      model: 'm2',
+      code: 'SERVER',
+      attempts: 3,
+    })
+    expect(agent.session.events.at(-1)).toMatchObject({
+      type: 'turn/end',
+      data: { reason: { kind: 'error', error: { code: 'SERVER' } } },
+    })
+  })
+
+  it('P2.1 halts switching once the cumulative cost cap is reached', async () => {
+    const h = await harness({
+      ds: [new LlmError('quota', 'QUOTA', { status: 402 })],
+      fb1: [new LlmError('down', 'SERVER', { status: 500 })],
+      fb2: [textResponse('should not run')],
+    }, {
+      fallbacks: [
+        { provider: 'fb1', model: 'm1' },
+        { provider: 'fb2', model: 'm2' },
+      ],
+      quota: {
+        // A tiny cap so the first fallback's projected cost already trips it.
+        costCap: 0.0001,
+        prices: { fb1: { input: 1, output: 1 } },
+        estimatedOutputTokens: 1000,
+      },
+    })
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('p2-costcap'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // ds failed → fb1/m1 was selected and its cost was charged, pushing the
+    // cumulative cost past the tiny cap. fb1 then failed too, but the cap now
+    // blocks any further switch to fb2/m2: the request issued list stops at
+    // fb1/m1 and a cost-cap-reached warning is the terminal notice.
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat', 'fb1/m1'])
+    const warnings = agent.session.events.filter(event => event.type === 'llm/quota-warning')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.data).toMatchObject({
+      reason: 'cost-cap-reached',
+      provider: 'fb1',
+      model: 'm1',
+      costCap: 0.0001,
+    })
+    expect(warnings[0]!.data.cumulativeCost).toBeGreaterThan(0)
+    // No fallback event reached fb2, and no exhausted notice either (the cap,
+    // not the chain, ended the step).
+    expect(agent.session.events.filter(event => event.type === 'llm/fallback')).toHaveLength(1)
+    expect(agent.session.events.filter(event => event.type === 'llm/fallback-exhausted')).toHaveLength(0)
   })
 
   it('T8.1 caches the provider catalog across switch selections', async () => {
@@ -1493,5 +1609,63 @@ describe('reset tool name', () => {
     // Tripwire for the registered literal: gateways reject names outside
     // ^[a-zA-Z0-9_-]+$; a rename must consciously keep this passing.
     expect('llm-fallback-reset').toMatch(/^[a-zA-Z0-9_-]+$/)
+  })
+})
+
+describe('config schema (the cordis-validated path)', () => {
+  // Regression anchor for the 2026-08 production outage: schemastery
+  // materializes ABSENT array/object fields as empty containers, so
+  // `config.codes ?? DEFAULT_FALLBACK_CODES` in apply() received [] (not
+  // nullish) and disabled every eligible code — under the real plugin loader
+  // no failure ever triggered a switch. The unit tests above call apply()
+  // directly and never saw it; these run the config through Config
+  // validation first, exactly how cordis (`runtime.Config["~standard"]`)
+  // mounts the plugin.
+  let ctx: Context | undefined
+
+  afterEach(async () => {
+    await ctx?.fiber.dispose()
+    ctx = undefined
+    vi.unstubAllGlobals()
+    delete process.env.DEEPSEEK_API_KEY
+  })
+
+  function validateConfig(raw: unknown): fallback.Config {
+    const standard = (fallback.Config as unknown as {
+      '~standard': { validate(config: unknown): { issues?: readonly unknown[]; value?: unknown } }
+    })['~standard']
+    const result = standard.validate(raw)
+    if (result.issues !== undefined && result.issues.length > 0) {
+      throw new Error(`config validation failed: ${JSON.stringify(result.issues)}`)
+    }
+    return result.value as fallback.Config
+  }
+
+  it('T9.1 switches on an eligible failure with a schema-validated config', async () => {
+    const validated = validateConfig({ fallbacks: [{ provider: 'gl', model: 'opus' }] })
+    const h = await harness({
+      ds: [new LlmError('quota exhausted', 'QUOTA', { status: 402 })],
+      gl: [textResponse('done')],
+    }, validated)
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('schema-validated'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat', 'gl/opus'])
+    expect(agent.session.events.filter(event => event.type === 'llm/fallback')).toHaveLength(1)
+  })
+
+  it('T9.2 fills code defaults for absent fields and accepts a strategy-less config', () => {
+    const validated = validateConfig({ fallbacks: [{ provider: 'gl', model: 'opus' }] })
+    expect(validated.codes).toEqual([...fallback.DEFAULT_FALLBACK_CODES])
+    expect(validated.unusableCodes).toEqual([...fallback.DEFAULT_UNUSABLE_CODES])
+    expect(validated.strategy?.mode).toBe('closest')
+    expect(validated.strategy?.performance?.axes).toEqual(['reasoning', 'context', 'output'])
+  })
+
+  it('T9.3 preserves an explicit empty codes array (disable escape hatch)', () => {
+    const validated = validateConfig({ fallbacks: [{ provider: 'gl', model: 'opus' }], codes: [] })
+    expect(validated.codes).toEqual([])
   })
 })

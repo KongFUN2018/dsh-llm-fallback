@@ -18,9 +18,9 @@ import type {} from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: pulls the conversation.chat.node seat and ChatNodeDataMap merge.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { en, zh, type FallbackKey } from './locales.ts'
-import { fallbackNodeDefinition, quotaWarningNodeDefinition } from './nodes.ts'
+import { fallbackNodeDefinition, quotaWarningNodeDefinition, fallbackExhaustedNodeDefinition } from './nodes.ts'
 import { bindFallbackTranslate } from './translate.ts'
-import { FallbackNodeView, QuotaWarningNodeView } from './views.tsx'
+import { FallbackNodeView, QuotaWarningNodeView, FallbackExhaustedNodeView } from './views.tsx'
 import { ResetButton, type ResetButtonInjected } from './resetButton.tsx'
 import type { SessionId, ISessions } from '@deepseek-ai/dsh-client-runtime/client'
 
@@ -47,10 +47,13 @@ export function apply(ctx: Context): void {
   bindFallbackTranslate(ctx.locale.bind(NS))
   ctx.conversationEvents.register(fallbackNodeDefinition)
   ctx.conversationEvents.register(quotaWarningNodeDefinition)
+  ctx.conversationEvents.register(fallbackExhaustedNodeDefinition)
   ctx.slots.inject('conversation.chat.node', () => ctx.slots.register(
     { name: 'conversation.chat.node', key: 'llm-fallback', locale: NS }, FallbackNodeView))
   ctx.slots.inject('conversation.chat.node', () => ctx.slots.register(
     { name: 'conversation.chat.node', key: 'llm-quota-warning', locale: NS }, QuotaWarningNodeView))
+  ctx.slots.inject('conversation.chat.node', () => ctx.slots.register(
+    { name: 'conversation.chat.node', key: 'llm-fallback-exhausted', locale: NS }, FallbackExhaustedNodeView))
 
   // One-click escape hatch: a subtle status-bar-style button in the composer
   // tool row that issues `/llm-fallback:reset` against the current session,

@@ -15,6 +15,12 @@ export declare const inject: string[];
 interface FallbackStats {
     agents: number;
     steps: number;
+    /** Total `llm/fallback` switch events issued (one per switch that went out). */
+    switches: number;
+    /** Switched routes that completed a model message successfully (success count). */
+    switchSuccess: number;
+    /** Eligible failures where no fallback candidate remained (chain exhausted). */
+    exhaustions: number;
 }
 /** Read a live plugin instance's step-state statistics, if installed. */
 export declare function getFallbackStats(ctx: Context): FallbackStats | undefined;
@@ -98,6 +104,10 @@ export interface Config {
         }>;
         /** Estimated output tokens per request for cost projection (default 1024). */
         estimatedOutputTokens?: number;
+        /** Cumulative projected-cost cap (in the provider's unit): once the plugin's
+         * accumulated projected cost reaches it, it stops switching and records a
+         * `cost-cap-reached` warning, letting the real failure take over. */
+        costCap?: number;
     };
 }
 export declare const Config: z<Config>;

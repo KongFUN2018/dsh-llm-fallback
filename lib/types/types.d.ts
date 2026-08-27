@@ -127,12 +127,33 @@ export interface LlmQuotaWarningEventData {
     inputPrice?: number;
     /** Output unit price (per million tokens) used in the estimate. */
     outputPrice?: number;
+    /** The configured cumulative-cost cap that was reached (for `cost-cap-reached`). */
+    costCap?: number;
+    /** The accumulated projected cost at the time the cap was reached. */
+    cumulativeCost?: number;
     /** Warning reason: preemptive switch below a threshold / above projected cost,
-     * or an `'unobservable'` note that a user-switched model has no disclosed
-     * allowance and will be probed with the current request (failing bans it). */
-    reason: 'below-threshold' | 'insufficient-cost' | 'unobservable';
+     * a `'cost-cap-reached'` stop-loss that halts further switching once the
+     * configured cumulative-cost cap is hit, or an `'unobservable'` note that a
+     * user-switched model has no disclosed allowance and will be probed with the
+     * current request (failing bans it). */
+    reason: 'below-threshold' | 'insufficient-cost' | 'cost-cap-reached' | 'unobservable';
     /** Strategy mode that selected the target, when a strategy was active. */
     mode?: StrategyMode;
+}
+/** Durable payload recorded when the fallback chain is exhausted for a step. */
+export interface LlmFallbackExhaustedEventData {
+    /** Turn containing the final failing request. */
+    turn: number;
+    /** Step containing the final failing request. */
+    step: number;
+    /** Provider route of the last request that failed. */
+    provider: string;
+    /** Model of the last request that failed. */
+    model: string;
+    /** Stable provider-neutral failure code of the last failed request. */
+    code: string;
+    /** Total requests issued in this step, including the final failure. */
+    attempts: number;
 }
 declare module '@deepseek-ai/dsh-session/types' {
     interface SessionEventMap {
@@ -140,6 +161,8 @@ declare module '@deepseek-ai/dsh-session/types' {
         'llm/fallback': LlmFallbackEventData;
         /** Durable, non-surface record of one preemptive quota warning switch. */
         'llm/quota-warning': LlmQuotaWarningEventData;
+        /** Durable, non-surface record of a step whose fallback chain was exhausted. */
+        'llm/fallback-exhausted': LlmFallbackExhaustedEventData;
     }
 }
 //# sourceMappingURL=types.d.ts.map

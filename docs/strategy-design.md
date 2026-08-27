@@ -176,5 +176,5 @@ strategy:
 ## 十三、分期
 
 - **P1（已实现）**：动态地板 F2 + per-model 价格 + cost/performance 全局评分选择 + F4 额度地板 + 升级阶梯 + 事件携带 mode/score
-- **P2（部分落地）**：UI 提示行显示模式（mode 标签 + cost 预估成本）已在浏览器半区落地；F3 工具声明、F5 推理连续性三档仍待定
-- **P3（可选）**：速度 EWMA、多步期望成本
+- **P2（部分落地）**：UI 提示行显示模式（mode 标签 + cost 预估成本）已在浏览器半区落地；F3 工具声明、F5 推理连续性三档仍待定。成本止损 `quota.costCap`（累计预估成本达上限即停止切换、记 `cost-cap-reached` 预警）已落地
+- **P3（部分落地）**：离线回放评估库 `tests/replay.spec.ts` 已落地——纯函数层回放候选集，验证 `sessionFailurePenalty`/`significantRatio` 等超参对选型的影响，每个用例编码意图。速度 EWMA、多步期望成本仍待定

@@ -14,6 +14,9 @@ export declare const zh: {
     'warning.insufficientCost': string;
     'warning.belowThresholdUnknown': string;
     'warning.unobservableProbe': string;
+    'warning.costCapReached': string;
+    'warning.costCapReachedUnknown': string;
+    'exhausted.message': string;
     'reset.label': string;
     'reset.title': string;
 };
@@ -30,6 +33,9 @@ export declare const en: {
     'warning.insufficientCost': string;
     'warning.belowThresholdUnknown': string;
     'warning.unobservableProbe': string;
+    'warning.costCapReached': string;
+    'warning.costCapReachedUnknown': string;
+    'exhausted.message': string;
     'reset.label': string;
     'reset.title': string;
 };

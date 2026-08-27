@@ -86,22 +86,24 @@ Both modes share one invariant: **the floor guarantees the switch can finish the
       prices:
         ds: { input: 0.27, output: 1.10 }
       estimatedOutputTokens: 1024
+      costCap: 5.0
 ```
 
 `fallbacks` is the ordered recovery chain. A route with `model` uses that exact model; one without it is resolved by capability match inside its provider. `codes` are eligible failure codes, `unusableCodes` advance the chain without banning, and `cooldownMs: 0` bans transient failures for the session. `pollIntervalMs` re-checks the primary route's allowance on an interval so a recovered allowance clears the session-healthy cache in time for the next request. `preference` breaks ties among capability-matched candidates within one provider: `closest` (default, nearest context window), `price` (smallest non-degrading window), `speed` (smallest output cap), or `reasoning` (prefers models that expose a reasoning effort).
 
 Quota interrogation resolves in precedence order: `static` (highest), then `providers` (code-level pluggable sources), then `queryers` (declarative HTTP endpoints whose response uses the DeepSeek `/user/balance` shape `{ is_available, balance_infos: [{ total_balance }] }`), then the built-in `deepseek` source (the DeepSeek `/user/balance` endpoint, with the API key resolved through `ctx.credentials` or the launching environment). Results are cached for `cacheMs` with single-flight de-duplication; any interrogation failure resolves to *unobservable* and never blocks a request.
 
-`thresholdAbsolute` and `thresholdRatio` (remaining/total) trigger preemptive switching. When `prices` maps a route to per-million-token unit prices, a per-request cost projection (`estimatedInputTokens` from the serialized transcript plus `estimatedOutputTokens`) also triggers a switch when the disclosed `remaining` cannot cover it; the `llm/quota-warning` event then records `estimatedCost`, `inputPrice`, and `outputPrice`.
+`thresholdAbsolute` and `thresholdRatio` (remaining/total) trigger preemptive switching. When `prices` maps a route to per-million-token unit prices, a per-request cost projection (`estimatedInputTokens` from the serialized transcript plus `estimatedOutputTokens`) also triggers a switch when the disclosed `remaining` cannot cover it; the `llm/quota-warning` event then records `estimatedCost`, `inputPrice`, and `outputPrice`. `costCap` sets an instance-wide cumulative projected-cost budget: once the plugin's accumulated per-request cost estimates reach it, it stops switching (letting the real failure take over) and records an `llm/quota-warning` with reason `cost-cap-reached`.
 
 ## Events
 
 Both events are non-surface and typed by the browser-safe `@kongfun2018/dsh-llm-fallback/types` subpath, so remote renderers can read durable status without loading the runtime.
 
 - `llm/fallback` — recorded immediately before switching: `{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`. `remaining` counts fallback chain entries at or after the selected route, not guaranteed viable candidates (under strategy/decision selection some may be banned or fail the floor), and it includes the selected route itself unless it was the very last entry.
-- `llm/quota-warning` — recorded when a pre-request check trips a threshold or cost projection, or when a user-switched model has an unobservable allowance: `{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, reason }` with `reason` of `below-threshold`, `insufficient-cost`, or `unobservable`.
+- `llm/quota-warning` — recorded when a pre-request check trips a threshold or cost projection, when the cumulative-cost cap is hit (stop-loss), or when a user-switched model has an unobservable allowance: `{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, costCap?, cumulativeCost?, reason }` with `reason` of `below-threshold`, `insufficient-cost`, `cost-cap-reached`, or `unobservable`.
+- `llm/fallback-exhausted` — recorded when an eligible failure finds no fallback candidate (the chain is exhausted): `{ turn, step, provider, model, code, attempts }`, naming the last failed route and the step's total request count.
 
-The separately published `./invariant` companion checks that every record names the current open turn/step, carries non-empty identifiers, non-negative numeric fields, a different from/to route for `llm/fallback`, and a known reason for `llm/quota-warning`.
+The separately published `./invariant` companion checks that every record names the current open turn/step, carries non-empty identifiers, non-negative numeric fields, a different from/to route for `llm/fallback`, `attempts ≥ 1` for `llm/fallback-exhausted`, and a known reason for `llm/quota-warning`.
 
 ## Known Limitations and Deferred Work
 
