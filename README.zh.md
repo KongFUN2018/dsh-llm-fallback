@@ -11,7 +11,8 @@
 ```bash
 npm install
 npm run build   # tsc 产出 lib/types/*.js + .d.ts，再由 tsdown 打包到 lib/
-npm test        # 83 个 vitest 测试
+npm test        # 116 个 vitest 测试
+npm run typecheck  # tsc --noEmit（快速类型检查）
 ```
 
 要求：Node ≥ 24，npm（或 pnpm）。运行时 peer 依赖为 DeepSeek Harness 的 `0.1.0-rc.6` 包（`@deepseek-ai/cordis`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-agent`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-credentials`、`@deepseek-ai/dsh-invariants`）。
@@ -23,6 +24,7 @@ npm test        # 83 个 vitest 测试
 - **失败即切换** —— 命中可切换失败码（`QUOTA`、`RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE`）时，沿 `fallbacks` 链推进，跳过没有可用模型的供应商，并返回 `{ kind: 'retry' }` 让循环以相同 turn/step 重新派生请求。
 - **能力对等选型** —— 回退路由省略 `model` 时，从该供应商真实的 `listModels` 目录中按「模态覆盖 > 能力不降级 > 接近度 > 成本」选择模型；结构性错误码（`NO_ADAPTER` 等）推进链但不冷却失败路由。
 - **任务延续** —— 工具循环中途切换时，已完成的工具结果保留，后续步骤继续在新模型上执行。
+- **切换前可用性探测** —— 开启 `probe.enabled` 后，每次选定的回退候选在正式切换前先用一次最小真实请求验证（默认 1 个 token）：探测失败的候选被会话内禁选，链条推进到下一候选，不可用路由永远不会拖垮当前 turn。被拒候选以 `llm/fallback` 事件记录，reason 为 `probe-failed`（切换从未完成）。
 - **不可观测供应商兜底探测** —— 没有额度源的供应商退化为试错：按顺序尝试候选，首个成功者被记为「会话内健康」。
 - **提前预警** —— 每次请求前检查当前路由额度：`warnAbsolute`/`warnRatio` 预警线按未来 `forecastSteps` 步投影，跌破时先发 `forecast-low` 提醒（不切换）；`thresholdAbsolute`/`thresholdRatio` 低于阈值时直接切换（不发失败请求），均记录 `llm/quota-warning`。
 - **尊重用户切模型** —— 用户主动切换会话模型时，尊重其选择（不会被改回会话健康回退路由），并对新选模型做一次**强制（跳过缓存）额度复查**：若额度不足则预警并切到可用回退；若额度**不可观测**，则以本次请求作为真实可用性探测（`llm/quota-warning` reason 为 `unobservable`），失败则禁选该模型并回退。
@@ -53,6 +55,8 @@ npm test        # 83 个 vitest 测试
 
 ## 配置
 
+在宿主配置文件（`cordis.yml`）中注册插件——下面片段展示的是插件清单部分：第一个 `- name:` 是你的上游 provider 插件，第二个在本插件与之并列注册。
+
 ```yaml
 - name: '@deepseek-ai/dsh-llm-deepseek'
 
@@ -70,6 +74,10 @@ npm test        # 83 个 vitest 测试
     allowDegrade: false
     allowUnknownCapacity: false
     preference: closest
+    probe:
+      enabled: true
+      timeoutMs: 6000
+      maxTokens: 1
     quota:
       thresholdAbsolute: 200
       thresholdRatio: 0.2
@@ -94,6 +102,8 @@ npm test        # 83 个 vitest 测试
 
 `fallbacks` 是有序回退链。带 `model` 的路由使用该确切模型；省略 `model` 的路由在其供应商内部按能力匹配选择。`codes` 是可切换失败码，`unusableCodes` 推进链但不禁选，`cooldownMs: 0` 表示会话内永久冷却瞬时失败。`pollIntervalMs` 定时复查主路由额度，额度恢复后在下一次请求前清除会话内健康缓存。`preference` 在同一供应商内多个能力对等候选之间打破平局：`closest`（默认，上下文窗口最接近）、`price`（非降级窗口最小）、`speed`（输出上限最小）、`reasoning`（优先暴露推理档位的模型）。
 
+`probe`（默认关闭）在正式切换前，对选定的回退候选发送一次最小真实请求验证——目录里列得出 ≠ 实际可用，路由可能已上架却没有额度或适配器已损坏。`maxTokens`（默认 1）与 `timeoutMs`（默认 6000）保证探测开销极小；`prompt` 可自定义无操作 ping 文案。探测失败的候选被会话内禁选，链条推进到下一候选，并以 reason 为 `probe-failed` 的 `llm/fallback` 事件记录这次拒绝。在「不可用候选不能拖垮当前 turn」的部署里开启它——真实宿主的 `UNKNOWN_MODEL` 正是这一类失败。
+
 额度查询按优先级依次解析：`static`（最高）→ `providers`（代码级可插拔查询源）→ `queryers`（声明式 HTTP 端点，响应采用 DeepSeek `/user/balance` 的 `{ is_available, balance_infos: [{ total_balance }] }` 形态）→ 内置 `deepseek` 源（DeepSeek `/user/balance` 端点，API key 经 `ctx.credentials` 或启动环境解析）。查询结果按 `cacheMs` 缓存并做单飞去重；任何查询失败都解析为「不可观测」，绝不阻塞请求。
 
 `thresholdAbsolute` 与 `thresholdRatio`（剩余/总量）触发主动切换。当 `prices` 为某路由配置每百万 token 单价时，单次消耗预估（序列化会话估算的输入 token 数 + `estimatedOutputTokens`）也会在已披露的 `remaining` 不足以覆盖时触发切换；此时 `llm/quota-warning` 事件记录 `estimatedCost`、`inputPrice`、`outputPrice`。`costCap` 设定一个实例级累计预估成本预算：当插件累计的单次请求预估成本达到该上限，停止切换（让真实失败接管），并记录一条 reason 为 `cost-cap-reached` 的 `llm/quota-warning`。
@@ -104,7 +114,7 @@ npm test        # 83 个 vitest 测试
 
 三类事件均为非表面事件，类型定义在浏览器安全的 `@kongfun2018/dsh-llm-fallback/types` 子路径中，远程渲染端无需加载运行时即可读取持久状态。
 
-- `llm/fallback` —— 切换前记录：`{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`。`remaining` 数的是选中路由所在及之后的**链上位置数**，而非"确定可用的候选数"（策略/LLM 决策选择下，部分位置可能已被禁选或不满足地板）；且除非所选路由就是最后一条，否则它计入本次的 `remaining`。
+- `llm/fallback` —— 切换前记录：`{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining, mode?, score?, reason? }`。`remaining` 数的是选中路由所在及之后的**链上位置数**，而非「确定可用的候选数」（策略/LLM 决策选择下，部分位置可能已被禁选或不满足地板）；且除非所选路由就是最后一条，否则它计入本次的 `remaining`。`mode` 是生效的策略模式、`score` 是该模式对所选路由的评分（性价比模式为预估成本）；`reason: 'probe-failed'` 标记候选被可用性探测拒绝——切换从未完成，事件记录这次拒绝。
 - `llm/quota-warning` —— 请求前检查触发阈值、消耗预估、累计成本达上限（止损）、用户切换模型后额度不可观测，或提前预警跌破预警线时记录：`{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, costCap?, cumulativeCost?, projectedBurn?, forecastSteps?, reason }`，`reason` 为 `below-threshold`、`insufficient-cost`、`cost-cap-reached`、`unobservable` 或 `forecast-low`。
 - `llm/fallback-exhausted` —— 合格失败且无回退候选（链条耗尽）时记录：`{ turn, step, provider, model, code, attempts }`，命名最后失败的路由与该步总请求数。
 

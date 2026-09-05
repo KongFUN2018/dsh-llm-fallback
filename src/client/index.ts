@@ -1,7 +1,8 @@
 /**
- * Browser half of the llm-fallback plugin: surfaces the two durable events
- * (`llm/fallback`, `llm/quota-warning`) as chat notice rows, so a switch is
- * visible in the conversation exactly where it happened. The host half owns
+ * Browser half of the llm-fallback plugin: surfaces the three durable events
+ * (`llm/fallback`, `llm/quota-warning`, `llm/fallback-exhausted`) as chat
+ * notice rows, so a switch is visible in the conversation exactly where it
+ * happened. The host half owns
  * the routing; this half only renders what it recorded — the composer's model
  * seat deliberately keeps showing the user's own selection.
  *
@@ -38,8 +39,8 @@ const NS = 'llmFallback'
 export const inject = ['conversationEvents', 'locale', 'slots', 'sessions']
 
 /**
- * Mount the browser half: dictionaries, the two Conversation Definitions, and
- * the two keyed chat renderers.
+ * Mount the browser half: dictionaries, the three Conversation Definitions,
+ * and the three keyed chat renderers.
  * @param ctx - Client Cordis context.
  */
 export function apply(ctx: Context): void {
