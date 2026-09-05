@@ -10,8 +10,8 @@ import z from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
-import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import type { LlmCallConfig, LlmModelInfo, LlmResolvedModelInfo, ModelModality } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmCallConfig, LlmModelInfo, LlmResolvedModelInfo, ModelModality, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { LlmFallbackRoute, QuotaCheck, QuotaProvider, QuotaStaticEntry, SelectionPreference, StrategyConfig, StrategyMode } from './types.ts'
@@ -129,6 +129,24 @@ export interface Config {
   preference?: SelectionPreference
   /** Strategy-mode selection (see docs/strategy-design.md); `closest` (or absent) keeps the legacy lazy chain walk. */
   strategy?: StrategyConfig
+  /** Post-selection availability probe: before a fallback switch is issued,
+   *  send a minimal real request to the chosen candidate to confirm it is
+   *  actually usable (directory presence ≠ usable; a route can be listed yet
+   *  have no quota or a broken adapter). A candidate that fails the probe is
+   *  banned for the session and the chain advances to the next one. Off by
+   *  default so existing callers without quota/probe knowledge are unaffected;
+   *  enable it in deployments where an unusable candidate must not kill a turn
+   *  (real-host UNKNOWN_MODEL is exactly this class of failure). */
+  probe?: {
+    /** Enable availability probing before issuing a fallback switch. */
+    enabled?: boolean
+    /** Probe request max output tokens (default 1): the cheapest confirmation. */
+    maxTokens?: number
+    /** Timeout for one probe (default 6000ms). */
+    timeoutMs?: number
+    /** Probe prompt; a no-op ping is fine. */
+    prompt?: string
+  }
   /** Preemptive quota warnings. */
   quota?: {
     /** Switch when remaining allowance falls below this absolute amount. */
@@ -163,6 +181,17 @@ export interface Config {
      * accumulated projected cost reaches it, it stops switching and records a
      * `cost-cap-reached` warning, letting the real failure take over. */
     costCap?: number
+    /** Advisory floor: warn (WITHOUT switching) when the projected remaining
+     * after `forecastSteps` more steps falls below this absolute amount.
+     * Set it above `thresholdAbsolute` so the heads-up precedes the switch. */
+    warnAbsolute?: number
+    /** Advisory floor as a ratio: warn (WITHOUT switching) when the projected
+     * remaining/total falls below this value (0..1). */
+    warnRatio?: number
+    /** Forward horizon in steps for the advisory projection (default 1).
+     * The per-step cost reuses this request's estimate, which over-projects a
+     * growing conversation — deliberate: warn earlier rather than later. */
+    forecastSteps?: number
   }
 }
 
@@ -200,6 +229,12 @@ export const Config: z<Config> = z.object({
       afterFailures: z.number().min(1).default(2),
     }),
   }),
+  probe: z.object({
+    enabled: z.boolean().default(false),
+    maxTokens: z.number().min(1).default(1),
+    timeoutMs: z.number().min(1).default(6000),
+    prompt: z.string().min(1),
+  }),
   quota: z.object({
     thresholdAbsolute: z.number().min(0),
     thresholdRatio: z.number().min(0).max(1),
@@ -226,6 +261,9 @@ export const Config: z<Config> = z.object({
     })),
     estimatedOutputTokens: z.number().min(1),
     costCap: z.number().min(0),
+    warnAbsolute: z.number().min(0),
+    warnRatio: z.number().min(0).max(1),
+    forecastSteps: z.number().min(1),
   }),
 })
 
@@ -286,7 +324,19 @@ interface AgentState {
   switchSuccess: number
   /** Eligible failures with no fallback candidate remaining (diagnostics). */
   exhaustions: number
+  /** Route key whose forecast-low advisory is currently latched (undefined =
+   * not latched). Level-latched: the advisory fires on entering the warn zone
+   * and re-arms when the projection leaves it or the route changes, so a slow
+   * burn inside the zone does not append one event row per request. */
+  forecastWarnedRoute: string | undefined
+  /** Rolling provider-reported output-token samples (provider → last N
+   * `usage.outputTokens` from completed `assistant/message` events), folded to
+   * refine the output side of the cost projection with real usage. */
+  outputSamples: Map<string, number[]>
 }
+
+/** Rolling sample cap for the per-provider output-token average. */
+const OUTPUT_SAMPLE_CAP = 8
 
 function stepKey(turn: number, step: number): string {
   return `${turn}/${step}`
@@ -456,19 +506,22 @@ function estimateInputTokens(session: Session): number {
   return tokens
 }
 
-/** Projected cost in the provider's unit, when a price is configured for the route. */
+/** Projected cost in the provider's unit, when a price is configured for the route.
+ * `outputTokensOverride` refines the output side with the provider's rolling
+ * real-usage average (folded from `assistant/message` events) when available. */
 function estimateCost(
   quota: QuotaConfig | undefined,
   provider: string,
   model: string,
   session: Session,
+  outputTokensOverride?: number,
 ): { cost: number; inputPrice: number; outputPrice: number } | undefined {
   const price = priceOf(quota?.prices, provider, model)
   if (price === undefined || (price.input === undefined && price.output === undefined)) return undefined
   const inputPrice = price.input ?? 0
   const outputPrice = price.output ?? 0
   const inputTokens = estimateInputTokens(session)
-  const outputTokens = quota?.estimatedOutputTokens ?? 1024
+  const outputTokens = outputTokensOverride ?? quota?.estimatedOutputTokens ?? 1024
   return { cost: (inputTokens * inputPrice + outputTokens * outputPrice) / 1_000_000, inputPrice, outputPrice }
 }
 
@@ -558,6 +611,8 @@ interface StrategyRun {
   failedRoutes: ReadonlySet<string>
   checkQuota: (provider: string, model: string, signal: AbortSignal) => Promise<QuotaCheck | undefined>
   signal: AbortSignal
+  /** Rolling real-usage output estimate per provider (undefined before samples). */
+  rollingOutput: (provider: string) => number | undefined
 }
 
 /** The chain-cursor directive a selection path returns.
@@ -685,9 +740,10 @@ async function selectNextByStrategy(
       if (until !== undefined && until > now) continue
       const info = infos[i]
       const price = priceOf(run.prices, entry.provider, id)
+      const outputTokens = run.rollingOutput(entry.provider) ?? run.settings.estimatedOutputTokens
       const projected = price === undefined || (price.input === undefined && price.output === undefined)
         ? undefined
-        : (inputTokens * (price.input ?? 0) + run.settings.estimatedOutputTokens * (price.output ?? 0)) / 1_000_000
+        : (inputTokens * (price.input ?? 0) + outputTokens * (price.output ?? 0)) / 1_000_000
       // Floor F4: a disclosed allowance that cannot cover this very request
       // would switch again immediately — exclude the route up front.
       if (projected !== undefined) {
@@ -873,6 +929,8 @@ function createAgentTracker(ctx: Context, clearQuota: () => void, onReset?: () =
       agentState.switches = 0
       agentState.switchSuccess = 0
       agentState.exhaustions = 0
+      agentState.forecastWarnedRoute = undefined
+      agentState.outputSamples.clear()
     }
     // Also drop cached/in-flight allowances so the next request re-interrogates,
     // and reset the instance-wide cost-cap accumulator.
@@ -889,7 +947,7 @@ function createAgentTracker(ctx: Context, clearQuota: () => void, onReset?: () =
   const stateFor = (agent: Agent): AgentState => {
     let state = states.get(agent)
     if (state === undefined) {
-      state = { steps: new Map(), healthyRoute: undefined, switchedKeys: new Set(), bannedUntil: new Map(), failedRoutes: new Set(), lastTurn: undefined, primaryRoute: undefined, switches: 0, switchSuccess: 0, exhaustions: 0 }
+      state = { steps: new Map(), healthyRoute: undefined, switchedKeys: new Set(), bannedUntil: new Map(), failedRoutes: new Set(), lastTurn: undefined, primaryRoute: undefined, switches: 0, switchSuccess: 0, exhaustions: 0, forecastWarnedRoute: undefined, outputSamples: new Map() }
       states.set(agent, state)
     }
     return state
@@ -978,6 +1036,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     failedRoutes: ReadonlySet<string>,
     checkQuota: StrategyRun['checkQuota'],
     signal: AbortSignal,
+    agentState: AgentState | undefined,
   ): StrategyRun | undefined => mode === undefined || strategySettings === undefined ? undefined : {
     mode,
     settings: { ...strategySettings, mode },
@@ -986,9 +1045,100 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     failedRoutes,
     checkQuota,
     signal,
+    rollingOutput: provider => rollingOutputTokens(agentState, provider),
   }
   const tracker = createAgentTracker(ctx, engine.clearAll, () => { cumulativeCost = 0 })
   const { states, sessionAgents, knownAgents, stateFor, stepFor } = tracker
+
+  /** Probe configuration, resolved from the public config. */
+  const probe = config.probe
+  const probeTimeoutMs = probe?.timeoutMs ?? 6000
+  const probeMaxTokens = probe?.maxTokens ?? 1
+  const probePrompt = probe?.prompt ?? 'ok'
+
+  /**
+   * Confirm a candidate fallback route is actually usable before issuing the
+   * switch. Directory presence is not a guarantee of usability: a route can be
+   * listed (pi-ai resolves it via `resolveModelInfo`) yet the host adapter
+   * rejects it at call time with `UNKNOWN_MODEL`, or the account has no quota
+   * (HTTP 402/429). Sending one minimal real request catches both classes.
+   *
+   * Uses {@link LlmRuntime.stream} (the public streaming entry point). The
+   * probe is NOT an `agent/request` — that event is only emitted by the agent
+   * loop's `buildRequest` via the `agent/request` waterfall (dsh-agent-loop),
+   * so a probe here never re-triggers this plugin's own `agent/request`
+   * recovery listener. It also does not go through `llm-retry` (that plugin
+   * only listens on `agent/request-error`). Any failure — throw, transport,
+   * timeout, empty output — resolves to "not usable" and never blocks: the
+   * plugin's never-block philosophy holds even for probes.
+   *
+   * @returns `{ok, reason?}` — ok=false with a free-text reason so the caller
+   *   can surface it to the session.
+   */
+  async function probeValidRoute(
+    route: ResolvedRoute,
+    signal: AbortSignal,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    if ((ctx as unknown as { llm?: { stream: (o: GenerateOptions) => AsyncIterable<StreamChunk> } }).llm === undefined) {
+      // No LLM service mounted (pure test harness): probing is impossible, so
+      // never block — treat the route as usable and let the real request judge.
+      return { ok: true }
+    }
+    const messages = [
+      createUserMessage({ content: [{ type: 'text', text: probePrompt }], source: { kind: 'user' } }),
+    ]
+    const abort = new AbortController()
+    const timer = setTimeout(() => abort.abort(), probeTimeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    try {
+      // Merge the given `signal` and the probe's own timeout: abort on either.
+      const linked = signal !== undefined
+        ? AbortSignal.any([signal, abort.signal])
+        : abort.signal
+      const stream = ctx.llm.stream({
+        provider: route.provider,
+        model: route.model,
+        messages,
+        maxTokens: probeMaxTokens,
+        ...route.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(route.reasoningEffort) },
+        signal: linked,
+      })
+      let sawAny = false
+      for await (const chunk of stream) {
+        if (chunk.type === 'block-start' || chunk.type === 'text-delta' || chunk.type === 'reasoning-delta' || chunk.type === 'block-end') {
+          sawAny = true
+          // A probe only needs proof the route is reachable and produces output.
+          // Stop as soon as we see content so a vision/reasoning-heavy model does
+          // not burn tokens exploring the full request.
+          if (chunk.type === 'block-start' || chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') break
+        } else if (chunk.type === 'finish') {
+          if (chunk.reason.kind === 'stop') {
+            // A successful stop is definitive: the answer completed.
+            return { ok: true }
+          }
+          // finish with error/aborted/max-tokens: not usable OR at least
+          // reachable. max-tokens at 1 token is expected to end length, which is
+          // still proof the route works. Only an explicit error is not usable.
+          if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
+            return { ok: false, reason: chunk.reason.kind }
+          }
+        }
+      }
+      // Loop ended without any definitive error and without a stop — the route
+      // streamed something (sawAny) or completed. Treat "streamed content" as
+      // usable; a genuinely dead route throws before yielding anything.
+      return { ok: sawAny }
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** Ban a route for the session (never probe it again until reset). */
+  const probeBan = (agentState: AgentState, route: ResolvedRoute): void => {
+    agentState.bannedUntil.set(routeKey(route), Number.POSITIVE_INFINITY)
+  }
 
   /** Retire step state for finished turns (turn numbers before `turn`). */
   function retireFinishedTurns(agentState: AgentState, turn: number): void {
@@ -1081,6 +1231,16 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     ctx.effect(() => disposeCommand, 'llm-fallback: reset command')
   }
 
+  /** Rolling real-usage output estimate for one provider: the mean of the last
+   * folded `usage.outputTokens` samples, or undefined before any sample. */
+  const rollingOutputTokens = (agentState: AgentState | undefined, provider: string): number | undefined => {
+    const samples = agentState?.outputSamples.get(provider)
+    if (samples === undefined || samples.length === 0) return undefined
+    let sum = 0
+    for (const sample of samples) sum += sample
+    return sum / samples.length
+  }
+
   // Outermost listener (registered before per-agent model selection): snapshot
   // the primary route, record the issued route, and rewrite it when a recovery
   // has resolved a fallback route.
@@ -1098,7 +1258,7 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     // Charge the projected cost of one request that actually goes out. The cost
     // cap is an instance-wide stop-loss budget, so the accumulator is per-apply.
     const chargeCost = (route: LlmCallConfig): void => {
-      const projected = estimateCost(quota, route.provider, route.model, agent.session)
+      const projected = estimateCost(quota, route.provider, route.model, agent.session, rollingOutputTokens(agentState, route.provider))
       if (projected !== undefined) cumulativeCost += projected.cost
     }
     // A pending route from a prior recovery rewrites the resolved config.
@@ -1147,16 +1307,45 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
   ): Promise<LlmCallConfig | undefined> {
     const quotaCheck = await checkQuota(resolved.provider, resolved.model, signal, userSwitched)
     const trip = quotaCheck === undefined ? { below: false } : belowThreshold(quotaCheck, quota)
-    const projected = estimateCost(quota, resolved.provider, resolved.model, agent.session)
+    const projected = estimateCost(quota, resolved.provider, resolved.model, agent.session, rollingOutputTokens(agentState, resolved.provider))
     const costTrip = projected !== undefined
       && quotaCheck?.remaining !== undefined
       && quotaCheck.remaining < projected.cost
     if (trip.below || costTrip) {
       const primaryCapability = await capabilityOf(catalog, resolved)
-      const result = await selectNext(
-        catalog, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(),
-        strategyRun(strategySettings?.mode, agent.session, agentState.failedRoutes, checkQuota, signal),
-      )
+      // Same probe-selection loop as the failure path: skip an unusable
+      // candidate before switching to it (a preemptive switch must not land on
+      // a route that is listed but not callable).
+      let result: SelectionOutcome | undefined
+      while (true) {
+        if (signal.aborted) return undefined
+        const candidate = await selectNext(
+          catalog, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(),
+          strategyRun(strategySettings?.mode, agent.session, agentState.failedRoutes, checkQuota, signal, agentState),
+        )
+        if (candidate === undefined) {
+          result = undefined
+          break
+        }
+        if (probe?.enabled !== true) {
+          result = candidate
+          break
+        }
+        const check = await probeValidRoute(candidate.route, signal)
+        if (check.ok) {
+          result = candidate
+          break
+        }
+        probeBan(agentState, candidate.route)
+        state.chainCursor = cursorIndexOf(candidate.cursor)
+        agent.session.append('llm/quota-warning', {
+          turn,
+          step,
+          provider: candidate.route.provider,
+          model: candidate.route.model,
+          reason: 'probe-failed',
+        })
+      }
       if (result !== undefined) {
         agentState.switchedKeys.add(routeKey(result.route))
         agent.session.append('llm/quota-warning', {
@@ -1181,6 +1370,54 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
         return withRoute(resolved, result.route)
       }
       return undefined
+    }
+    // Advisory forecast: warn (WITHOUT switching) when the projected remaining
+    // after `forecastSteps` more steps falls below a configured advisory floor
+    // (`warnAbsolute`, or `warnRatio` against the disclosed total). An unpriced
+    // route projects zero burn, degrading to a pure balance floor. The advisory
+    // is level-latched per route: it fires on entering the warn zone and
+    // re-arms when the projection leaves it (e.g. a top-up) or the route
+    // changes, so a slow burn inside the zone appends one row, not one per
+    // request. The hard switch thresholds above stay the authoritative
+    // escalation point; this only gives the user an earlier heads-up.
+    if (quota !== undefined && quotaCheck !== undefined && quotaCheck.remaining !== undefined
+      && (quota.warnAbsolute !== undefined || quota.warnRatio !== undefined)) {
+      const forecastSteps = quota.forecastSteps ?? 1
+      const burn = projected !== undefined ? projected.cost * forecastSteps : 0
+      const projectedRemaining = quotaCheck.remaining - burn
+      const absoluteTrip = quota.warnAbsolute !== undefined && projectedRemaining < quota.warnAbsolute
+      const ratioTrip = quota.warnRatio !== undefined
+        && quotaCheck.total !== undefined && quotaCheck.total > 0
+        && projectedRemaining / quotaCheck.total < quota.warnRatio
+      const route = routeKey(resolved)
+      if (absoluteTrip || ratioTrip) {
+        if (agentState.forecastWarnedRoute !== route) {
+          agentState.forecastWarnedRoute = route
+          agent.session.append('llm/quota-warning', {
+            turn,
+            step,
+            provider: resolved.provider,
+            model: resolved.model,
+            remaining: quotaCheck.remaining,
+            ...quotaCheck.total === undefined ? {} : { total: quotaCheck.total },
+            ...absoluteTrip && quota.warnAbsolute !== undefined
+              ? { threshold: quota.warnAbsolute, thresholdKind: 'absolute' as const }
+              : quota.warnRatio !== undefined
+                ? { threshold: quota.warnRatio, thresholdKind: 'ratio' as const }
+                : {},
+            ...projected !== undefined ? {
+              estimatedCost: projected.cost,
+              inputPrice: projected.inputPrice,
+              outputPrice: projected.outputPrice,
+            } : {},
+            projectedBurn: burn,
+            forecastSteps,
+            reason: 'forecast-low' as const,
+          })
+        }
+      } else {
+        agentState.forecastWarnedRoute = undefined
+      }
     }
     if (userSwitched && quotaCheck?.remaining === undefined) {
       // The user picked a model whose allowance is unobservable. Honor the
@@ -1241,10 +1478,52 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
         ? 'performance'
         : strategySettings.mode
     const primaryCapability = await capabilityOf(catalog, primary)
-    const result = await selectNext(
-      catalog, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(),
-      strategyRun(effectiveMode, agent.session, agentState.failedRoutes, checkQuota, signal),
-    )
+    // Probe-selection loop: selectNext picks one candidate; if the probe is
+    // enabled the route is confirmed usable before the switch is issued. A
+    // probe failure bans the route for the session and re-selects — the chain
+    // advances because selectNext consumed that candidate's cursor. This is the
+    // "verify usability before switching" guarantee: a route that is listed in
+    // the catalog but is not actually callable (UNKNOWN_MODEL, no quota, broken
+    // adapter) never kills the turn, it is skipped for a later candidate.
+    let outcome: SelectionOutcome | undefined
+    while (true) {
+      if (signal.aborted) return next()
+      const candidate = await selectNext(
+        catalog, chain, state.chainCursor, primaryCapability, opts, agentState.bannedUntil, Date.now(),
+        strategyRun(effectiveMode, agent.session, agentState.failedRoutes, checkQuota, signal, agentState),
+      )
+      if (candidate === undefined) {
+        outcome = undefined
+        break
+      }
+      if (probe?.enabled !== true) {
+        outcome = candidate
+        break
+      }
+      const check = await probeValidRoute(candidate.route, signal)
+      if (check.ok) {
+        outcome = candidate
+        break
+      }
+      // Probe failed: this candidate is unusable this session. Ban it so the
+      // next selectNext skips it, log the skip to the session, and re-select.
+      probeBan(agentState, candidate.route)
+      state.chainCursor = cursorIndexOf(candidate.cursor)
+      agentState.switches += 1
+      agent.session.append('llm/fallback', {
+        turn,
+        step,
+        fromProvider: from.provider,
+        fromModel: from.model,
+        toProvider: candidate.route.provider,
+        toModel: candidate.route.model,
+        code: failure.code,
+        remaining: chain.length - cursorIndexOf(candidate.cursor),
+        reason: 'probe-failed',
+        ...candidate.mode === undefined ? {} : { mode: candidate.mode },
+      })
+    }
+    const result = outcome
     if (result === undefined) {
       // The chain is exhausted for this step: no candidate remains. Count it only
       // for a genuine (eligible) failure — a structural (unusable) code advancing
@@ -1328,6 +1607,20 @@ export function apply(ctx: Context, config: Config = { fallbacks: [] }): void {
     if (agentState.switchedKeys.has(routeKey(source))) {
       agentState.healthyRoute = { provider: source.provider, model: source.model }
       agentState.switchSuccess += 1
+    }
+    // Fold the provider-reported output tokens into the rolling per-provider
+    // average that refines the cost projection's output side. The input side
+    // keeps tracking the live transcript (chars/4), which an average cannot
+    // represent; usage is attributed only when the adapter reported it.
+    const usage = event.data.usage
+    if (usage !== undefined && typeof usage.outputTokens === 'number' && usage.outputTokens > 0) {
+      const samples = agentState.outputSamples.get(source.provider)
+      if (samples === undefined) {
+        agentState.outputSamples.set(source.provider, [usage.outputTokens])
+      } else {
+        samples.push(usage.outputTokens)
+        if (samples.length > OUTPUT_SAMPLE_CAP) samples.shift()
+      }
     }
   }, { global: true })
   // If the internal dispatch mechanism is absent (DSH refactor), the healthy

@@ -58,15 +58,16 @@ export function FallbackNodeView({ node }: { node: { readonly data: FallbackChat
         <div key={switched.seq} style={lineStyle}>
           <span style={iconStyle} aria-hidden>⇄</span>
           <span>
-            {fbT('fallback.prefix')}
-            <span style={routeStyle}>{switched.from}</span>
-            {' → '}
-            <span style={routeStyle}>{switched.to}</span>
+            {switched.reason === 'probe-failed'
+              ? fbT('warning.probeFailed', { route: switched.to })
+              : <>{fbT('fallback.prefix')}<span style={routeStyle}>{switched.from}</span>{' → '}<span style={routeStyle}>{switched.to}</span></>}
           </span>
           <span style={detailStyle}>
-            {switched.remaining > 0
-              ? fbT('fallback.detail', { code: switched.code, count: switched.remaining })
-              : fbT('fallback.detailLast', { code: switched.code })}
+            {switched.reason === 'probe-failed'
+              ? ' '
+              : switched.remaining > 0
+                ? fbT('fallback.detail', { code: switched.code, count: switched.remaining })
+                : fbT('fallback.detailLast', { code: switched.code })}
           </span>
           {strategyDetail(switched.mode, switched.score)}
         </div>
@@ -91,6 +92,17 @@ function warningText(data: QuotaWarningChatData): string {
         : fbT('warning.costCapReachedUnknown', { route: data.route })
     case 'unobservable':
       return fbT('warning.unobservableProbe', { route: data.route })
+    case 'forecast-low':
+      return data.remaining !== undefined
+        ? data.projectedBurn !== undefined && data.forecastSteps !== undefined
+          ? fbT('warning.forecastLow', {
+            route: data.route,
+            remaining: String(data.remaining),
+            burn: String(data.projectedBurn),
+            steps: String(data.forecastSteps),
+          })
+          : fbT('warning.forecastLowUnknown', { route: data.route, remaining: String(data.remaining) })
+        : fbT('warning.belowThresholdUnknown', { route: data.route })
     case 'insufficient-cost':
       return data.remaining !== undefined
         ? fbT('warning.insufficientCost', { route: data.route, remaining: String(data.remaining) })
@@ -103,6 +115,8 @@ function warningText(data: QuotaWarningChatData): string {
           threshold: String(data.threshold),
         })
         : fbT('warning.belowThresholdUnknown', { route: data.route })
+    case 'probe-failed':
+      return fbT('warning.probeFailed', { route: data.route })
   }
 }
 

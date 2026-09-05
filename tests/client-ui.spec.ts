@@ -175,6 +175,40 @@ describe('quotaWarningNodeDefinition', () => {
     expect(state.estimatedCost).toBeUndefined()
   })
 
+  it('accepts the forecast-low advisory and projects its burn fields', () => {
+    const event = eventOf('llm/quota-warning', 16, {
+      turn: 3, step: 1, provider: 'ds', model: 'chat', remaining: 0.04, total: 1,
+      threshold: 0.05, thresholdKind: 'ratio', estimatedCost: 0.001,
+      projectedBurn: 0.01, forecastSteps: 10, reason: 'forecast-low',
+    })
+    const match = matchOf(event)
+    expect(quotaWarningNodeDefinition.match?.(event))
+      .toEqual({ id: 'llm-quota-warning:16', role: 'start' })
+    const state = quotaWarningNodeDefinition.start(contextOf(undefined, match), match, reader)
+    expect(state).toMatchObject({
+      route: 'ds/chat',
+      remaining: 0.04,
+      total: 1,
+      threshold: 0.05,
+      projectedBurn: 0.01,
+      forecastSteps: 10,
+      reason: 'forecast-low',
+    })
+  })
+
+  it('accepts forecast-low without burn fields (unpriced route advisory)', () => {
+    const event = eventOf('llm/quota-warning', 17, {
+      turn: 3, step: 2, provider: 'az', model: 'gpt', remaining: 2, reason: 'forecast-low',
+    })
+    const match = matchOf(event)
+    expect(quotaWarningNodeDefinition.match?.(event))
+      .toEqual({ id: 'llm-quota-warning:17', role: 'start' })
+    const state = quotaWarningNodeDefinition.start(contextOf(undefined, match), match, reader)
+    expect(state).toMatchObject({ route: 'az/gpt', remaining: 2, reason: 'forecast-low' })
+    expect(state.projectedBurn).toBeUndefined()
+    expect(state.forecastSteps).toBeUndefined()
+  })
+
   it('buildViewNode anchors a visible chat node at the event seq', () => {
     const match = matchOf(eventOf('llm/quota-warning', 14, WARNING_DATA))
     const state = quotaWarningNodeDefinition.start(contextOf(undefined, match), match, reader)

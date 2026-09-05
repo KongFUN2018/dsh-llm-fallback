@@ -36,6 +36,9 @@ export interface FallbackSwitchRow {
     readonly mode?: 'cost' | 'performance' | 'closest';
     /** The mode's score for the selected route (cost mode: projected cost), when defined. */
     readonly score?: number;
+    /** `probe-failed` marks a post-selection availability probe that rejected the
+     *  candidate before it was switched to — the switch was skipped, not completed. */
+    readonly reason?: 'probe-failed';
 }
 /** Chat payload of one llm/fallback event. */
 export interface FallbackChatData {
@@ -51,11 +54,15 @@ export interface QuotaWarningChatData {
     readonly total?: number;
     readonly threshold?: number;
     readonly estimatedCost?: number;
-    readonly reason: 'below-threshold' | 'insufficient-cost' | 'cost-cap-reached' | 'unobservable';
+    readonly reason: 'below-threshold' | 'insufficient-cost' | 'cost-cap-reached' | 'unobservable' | 'forecast-low' | 'probe-failed';
     /** The configured cumulative-cost cap that was reached (for cost-cap-reached). */
     readonly costCap?: number;
     /** The accumulated projected cost at the time the cap was reached. */
     readonly cumulativeCost?: number;
+    /** Projected spend of the next forecastSteps steps (for forecast-low). */
+    readonly projectedBurn?: number;
+    /** Forward horizon in steps used by the forecast-low projection. */
+    readonly forecastSteps?: number;
     /** Strategy mode that selected the target, when a strategy was active. */
     readonly mode?: 'cost' | 'performance' | 'closest';
 }

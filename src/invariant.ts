@@ -54,7 +54,7 @@ function validateWarning(
   event: SessionEvent<'llm/quota-warning'>,
   fail: InvariantFailure,
 ): void {
-  const { turn, step, provider, model, remaining, total, threshold, thresholdKind, estimatedCost, inputPrice, outputPrice, costCap, cumulativeCost, reason, mode } = event.data
+  const { turn, step, provider, model, remaining, total, threshold, thresholdKind, estimatedCost, inputPrice, outputPrice, costCap, cumulativeCost, projectedBurn, forecastSteps, reason, mode } = event.data
   if (!Number.isSafeInteger(turn) || turn < 1) fail('llm/quota-warning turn must be a positive safe integer')
   if (!Number.isSafeInteger(step) || step < 1) fail('llm/quota-warning step must be a positive safe integer')
   if (typeof provider !== 'string' || provider.length === 0) fail('llm/quota-warning provider must be a non-empty string')
@@ -68,7 +68,9 @@ function validateWarning(
   if (outputPrice !== undefined && (typeof outputPrice !== 'number' || outputPrice < 0)) fail('llm/quota-warning outputPrice must be non-negative when present')
   if (costCap !== undefined && (typeof costCap !== 'number' || costCap < 0)) fail('llm/quota-warning costCap must be non-negative when present')
   if (cumulativeCost !== undefined && (typeof cumulativeCost !== 'number' || cumulativeCost < 0)) fail('llm/quota-warning cumulativeCost must be non-negative when present')
-  if (reason !== 'below-threshold' && reason !== 'insufficient-cost' && reason !== 'cost-cap-reached' && reason !== 'unobservable') fail('llm/quota-warning reason must be a known reason')
+  if (projectedBurn !== undefined && (typeof projectedBurn !== 'number' || projectedBurn < 0)) fail('llm/quota-warning projectedBurn must be non-negative when present')
+  if (forecastSteps !== undefined && (!Number.isSafeInteger(forecastSteps) || forecastSteps < 1)) fail('llm/quota-warning forecastSteps must be a positive safe integer when present')
+  if (reason !== 'below-threshold' && reason !== 'insufficient-cost' && reason !== 'cost-cap-reached' && reason !== 'unobservable' && reason !== 'forecast-low') fail('llm/quota-warning reason must be a known reason')
   if (mode !== undefined && mode !== 'cost' && mode !== 'performance' && mode !== 'closest') {
     fail(`llm/quota-warning mode must be ${STRATEGY_MODES} when present`)
   }

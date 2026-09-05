@@ -16,6 +16,9 @@ export declare const zh: {
     'warning.unobservableProbe': string;
     'warning.costCapReached': string;
     'warning.costCapReachedUnknown': string;
+    'warning.forecastLow': string;
+    'warning.forecastLowUnknown': string;
+    'warning.probeFailed': string;
     'exhausted.message': string;
     'reset.label': string;
     'reset.title': string;
@@ -35,6 +38,9 @@ export declare const en: {
     'warning.unobservableProbe': string;
     'warning.costCapReached': string;
     'warning.costCapReachedUnknown': string;
+    'warning.forecastLow': string;
+    'warning.forecastLowUnknown': string;
+    'warning.probeFailed': string;
     'exhausted.message': string;
     'reset.label': string;
     'reset.title': string;

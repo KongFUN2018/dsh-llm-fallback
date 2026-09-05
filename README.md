@@ -35,7 +35,7 @@ To use the plugin as a dependency: `npm install @kongfun2018/dsh-llm-fallback`, 
 The package ships a browser companion (declared through its `dsh.client` field) that the DSH web shell loads automatically whenever the node half is loaded. It registers two Conversation Definitions plus two keyed chat renderers, so the durable events surface where they happened:
 
 - **`llm/fallback`** renders one muted row per switch — `⇄ Switched model automatically: ds/chat → gl/haiku · reason QUOTA · 2 fallback route(s) left`.
-- **`llm/quota-warning`** renders one row per preemptive switch — `⚠ Quota warning: ds/chat has 10 left (threshold 20) — switched preemptively`.
+- **`llm/quota-warning`** renders one row per preemptive switch or advisory — `⚠ Quota warning: ds/chat has 10 left (threshold 20) — switched preemptively`, and for the forecast advisory `⚠ Balance forecast: ds/chat has 5 left — projected short after ~10 more step(s) costing ~0.01; consider topping up`.
 
 The composer's model seat deliberately keeps showing your own selection: selection is intent, routing is the plugin's job. The actual model behind each reply remains visible per message in the Trajectory view's provenance, and these rows mark every switch inline.
 
@@ -87,6 +87,9 @@ Both modes share one invariant: **the floor guarantees the switch can finish the
         ds: { input: 0.27, output: 1.10 }
       estimatedOutputTokens: 1024
       costCap: 5.0
+      warnAbsolute: 100
+      warnRatio: 0.4
+      forecastSteps: 10
 ```
 
 `fallbacks` is the ordered recovery chain. A route with `model` uses that exact model; one without it is resolved by capability match inside its provider. `codes` are eligible failure codes, `unusableCodes` advance the chain without banning, and `cooldownMs: 0` bans transient failures for the session. `pollIntervalMs` re-checks the primary route's allowance on an interval so a recovered allowance clears the session-healthy cache in time for the next request. `preference` breaks ties among capability-matched candidates within one provider: `closest` (default, nearest context window), `price` (smallest non-degrading window), `speed` (smallest output cap), or `reasoning` (prefers models that expose a reasoning effort).
@@ -95,19 +98,21 @@ Quota interrogation resolves in precedence order: `static` (highest), then `prov
 
 `thresholdAbsolute` and `thresholdRatio` (remaining/total) trigger preemptive switching. When `prices` maps a route to per-million-token unit prices, a per-request cost projection (`estimatedInputTokens` from the serialized transcript plus `estimatedOutputTokens`) also triggers a switch when the disclosed `remaining` cannot cover it; the `llm/quota-warning` event then records `estimatedCost`, `inputPrice`, and `outputPrice`. `costCap` sets an instance-wide cumulative projected-cost budget: once the plugin's accumulated per-request cost estimates reach it, it stops switching (letting the real failure take over) and records an `llm/quota-warning` with reason `cost-cap-reached`.
 
+The advisory forecast (`warnAbsolute` / `warnRatio`, optionally `forecastSteps`, default 1) is the early-warning tier **above** those switch thresholds: when the projected remaining after `forecastSteps` more steps (`remaining − per-step cost × forecastSteps`; an unpriced route projects zero burn) falls below the floor, the plugin records an `llm/quota-warning` with reason `forecast-low` — **without switching**. Set the advisory floor above the switch threshold so the heads-up precedes the escalation. The advisory is level-latched per route: it fires on entering the warn zone and re-arms when the projection leaves it (e.g. a top-up) or the route changes, so a slow burn inside the zone appends one row, not one per request. `resetFallback` clears the latch.
+
 ## Events
 
 Both events are non-surface and typed by the browser-safe `@kongfun2018/dsh-llm-fallback/types` subpath, so remote renderers can read durable status without loading the runtime.
 
 - `llm/fallback` — recorded immediately before switching: `{ turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining }`. `remaining` counts fallback chain entries at or after the selected route, not guaranteed viable candidates (under strategy/decision selection some may be banned or fail the floor), and it includes the selected route itself unless it was the very last entry.
-- `llm/quota-warning` — recorded when a pre-request check trips a threshold or cost projection, when the cumulative-cost cap is hit (stop-loss), or when a user-switched model has an unobservable allowance: `{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, costCap?, cumulativeCost?, reason }` with `reason` of `below-threshold`, `insufficient-cost`, `cost-cap-reached`, or `unobservable`.
+- `llm/quota-warning` — recorded when a pre-request check trips a threshold or cost projection, when the cumulative-cost cap is hit (stop-loss), when a user-switched model has an unobservable allowance, or when the advisory forecast falls below its floor: `{ turn, step, provider, model, remaining?, total?, threshold?, estimatedCost?, inputPrice?, outputPrice?, costCap?, cumulativeCost?, projectedBurn?, forecastSteps?, reason }` with `reason` of `below-threshold`, `insufficient-cost`, `cost-cap-reached`, `unobservable`, or `forecast-low`.
 - `llm/fallback-exhausted` — recorded when an eligible failure finds no fallback candidate (the chain is exhausted): `{ turn, step, provider, model, code, attempts }`, naming the last failed route and the step's total request count.
 
 The separately published `./invariant` companion checks that every record names the current open turn/step, carries non-empty identifiers, non-negative numeric fields, a different from/to route for `llm/fallback`, `attempts ≥ 1` for `llm/fallback-exhausted`, and a known reason for `llm/quota-warning`.
 
 ## Known Limitations and Deferred Work
 
-- **Input-token projection is a rough estimate** — the cost check serializes the derived transcript and divides by four characters-per-token; exact token accounting needs a provider metering source.
+- **Input-token projection is a rough estimate** — the cost check serializes the derived transcript and divides by four characters-per-token; exact token accounting needs a provider metering source. The **output** side is refined automatically: when the adapter reports `usage` on `assistant/message` events, the plugin keeps a rolling per-provider average (last 8 samples) and projects with it before falling back to `estimatedOutputTokens` (default 1024); `resetFallback` clears the samples.
 - **Polling is best-effort** — `pollIntervalMs` re-checks the primary route's allowance to clear a stale fallback; it never interrupts an in-flight turn, and quota kinds that disclose no reset time stay unobservable between requests.
 - **Health cache lives in-session** — a successful probed route stays preferred until the next failure or a negating quota check; it is not persisted across sessions.
 - **`llm/fallback` records switching, not completion** — later step and turn events establish success or exhaustion.

@@ -77,6 +77,10 @@ export interface LlmFallbackEventData {
   mode?: StrategyMode
   /** The mode's score for the selected route (cost mode: projected cost), when defined. */
   score?: number
+  /** `probe-failed` marks a post-selection availability probe that rejected the
+   *  candidate before it was ever switched to — the switch never completed, it
+   *  was skipped by {@link index.probeValidRoute}. */
+  reason?: 'probe-failed'
 }
 
 /** How one provider route exposes its remaining allowance. */
@@ -142,12 +146,18 @@ export interface LlmQuotaWarningEventData {
   costCap?: number
   /** The accumulated projected cost at the time the cap was reached. */
   cumulativeCost?: number
+  /** Projected spend of the next `forecastSteps` steps in the provider's unit (for `forecast-low`), when the route is priced. */
+  projectedBurn?: number
+  /** Forward horizon in steps used by the `forecast-low` projection. */
+  forecastSteps?: number
   /** Warning reason: preemptive switch below a threshold / above projected cost,
    * a `'cost-cap-reached'` stop-loss that halts further switching once the
-   * configured cumulative-cost cap is hit, or an `'unobservable'` note that a
+   * configured cumulative-cost cap is hit, an `'unobservable'` note that a
    * user-switched model has no disclosed allowance and will be probed with the
-   * current request (failing bans it). */
-  reason: 'below-threshold' | 'insufficient-cost' | 'cost-cap-reached' | 'unobservable'
+   * current request (failing bans it), or a `'forecast-low'` advisory that the
+   * projected remaining after `forecastSteps` more steps falls below the
+   * configured advisory floor — advisory only, the request is not switched. */
+  reason: 'below-threshold' | 'insufficient-cost' | 'cost-cap-reached' | 'unobservable' | 'forecast-low' | 'probe-failed'
   /** Strategy mode that selected the target, when a strategy was active. */
   mode?: StrategyMode
 }

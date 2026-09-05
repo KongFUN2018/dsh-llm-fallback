@@ -1495,6 +1495,268 @@ describe('llm-fallback (slice 1: fail-and-switch)', () => {
   })
 })
 
+describe('quota forecast advisory (forecast-low)', () => {
+  let ctx: Context | undefined
+
+  afterEach(async () => {
+    await ctx?.fiber.dispose()
+    ctx = undefined
+    vi.unstubAllGlobals()
+    delete process.env.DEEPSEEK_API_KEY
+  })
+
+  const forecastEvents = (agent: { session: { events: ReadonlyArray<{ type: string; data: unknown }> } }): LlmQuotaWarningEventData[] =>
+    agent.session.events.filter(event => event.type === 'llm/quota-warning')
+      .map(event => event.data as LlmQuotaWarningEventData)
+      .filter(data => data.reason === 'forecast-low')
+
+  // Deterministic pricing: input is free, output is 1/M tokens at 1000 output
+  // tokens per request — exactly 0.001 per step, so `burn` is 0.001 * steps.
+  const priced = (quota: fallback.Config['quota']): fallback.Config => ({
+    fallbacks: [{ provider: 'gl', model: 'opus' }],
+    quota: { estimatedOutputTokens: 1000, prices: { ds: { input: 0, output: 1 } }, ...quota },
+  })
+
+  it('F1 warns once entering the warn zone without switching the route', async () => {
+    const h = await harness({
+      ds: [textResponse('done')],
+      gl: [textResponse('unused')],
+    }, priced({
+      warnAbsolute: 0.045,
+      forecastSteps: 10,
+      static: { ds: { kind: 'balance', remaining: 0.05 }, gl: { kind: 'balance', remaining: 100 } },
+    }))
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('forecast-absolute'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // Advisory only: the request still goes out on the primary route.
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat'])
+    const warnings = forecastEvents(agent)
+    expect(warnings).toEqual([{
+      turn: 1,
+      step: 1,
+      provider: 'ds',
+      model: 'chat',
+      remaining: 0.05,
+      threshold: 0.045,
+      thresholdKind: 'absolute',
+      estimatedCost: 1000 / 1_000_000,
+      inputPrice: 0,
+      outputPrice: 1,
+      projectedBurn: (1000 / 1_000_000) * 10,
+      forecastSteps: 10,
+      reason: 'forecast-low',
+    }])
+  })
+
+  it('F2 latches inside the zone: a second turn does not append a second row', async () => {
+    const h = await harness({
+      ds: [textResponse('one'), textResponse('two')],
+      gl: [textResponse('unused')],
+    }, priced({
+      warnAbsolute: 0.045,
+      forecastSteps: 10,
+      static: { ds: { kind: 'balance', remaining: 0.05 }, gl: { kind: 'balance', remaining: 100 } },
+    }))
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('forecast-latch'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat', 'ds/chat'])
+    expect(forecastEvents(agent)).toHaveLength(1)
+  })
+
+  it('F3 re-arms after a top-up and warns again on re-entry', async () => {
+    let remaining = 0.05
+    const h = await harness({
+      ds: [textResponse('one'), textResponse('two'), textResponse('three')],
+      gl: [textResponse('unused')],
+    }, priced({
+      warnAbsolute: 0.05,
+      // The dynamic provider source bypasses static entries; a zero cache TTL
+      // makes each turn observe the mutated remaining.
+      cacheMs: 0,
+      providers: [{ name: 'mutable', check: () => Promise.resolve({ kind: 'balance' as const, remaining }) }],
+    }))
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('forecast-rearm'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(forecastEvents(agent)).toHaveLength(1)
+
+    remaining = 1
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(forecastEvents(agent)).toHaveLength(1)
+
+    remaining = 0.05
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'three' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(forecastEvents(agent)).toHaveLength(2)
+  })
+
+  it('F4 the projection, not the raw balance, trips the advisory (and default horizon is 1)', async () => {
+    // Remaining 0.5 sits above the 0.45 floor; 100 projected steps (0.1 burn)
+    // pull the projection to 0.4 — under the floor — so the advisory fires.
+    const h = await harness({
+      ds: [textResponse('done')],
+      gl: [textResponse('unused')],
+    }, priced({
+      warnAbsolute: 0.45,
+      forecastSteps: 100,
+      static: { ds: { kind: 'balance', remaining: 0.5 }, gl: { kind: 'balance', remaining: 100 } },
+    }))
+    const agent1 = h.ctx.agentLoop.create(SessionId('forecast-horizon'), { provider: 'ds', model: 'chat' })
+    agent1.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent1.whenIdle()
+    expect(forecastEvents(agent1)).toHaveLength(1)
+    await h.ctx.fiber.dispose()
+
+    // Same balance and floor without a horizon (default 1): the projection
+    // stays above the floor, so nothing fires (legacy behavior).
+    const h2 = await harness({
+      ds: [textResponse('done')],
+      gl: [textResponse('unused')],
+    }, priced({
+      warnAbsolute: 0.45,
+      static: { ds: { kind: 'balance', remaining: 0.5 }, gl: { kind: 'balance', remaining: 100 } },
+    }))
+    ctx = h2.ctx
+    const agent2 = ctx.agentLoop.create(SessionId('forecast-default-horizon'), { provider: 'ds', model: 'chat' })
+    agent2.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent2.whenIdle()
+    expect(h2.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat'])
+    expect(forecastEvents(agent2)).toHaveLength(0)
+  })
+
+  it('F5 stays silent when no advisory floor is configured (backward compatible)', async () => {
+    const h = await harness({
+      ds: [textResponse('done')],
+      gl: [textResponse('unused')],
+    }, priced({
+      // Balance low enough to sit inside where a zone would be, high enough to
+      // cover this one request's projected cost (0.001) so the pre-existing
+      // insufficient-cost switch does not fire either.
+      static: { ds: { kind: 'balance', remaining: 0.05 }, gl: { kind: 'balance', remaining: 100 } },
+    }))
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('forecast-disabled'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    expect(h.adapter.requests.map(request => `${request.provider}/${request.model}`)).toEqual(['ds/chat'])
+    expect(agent.session.events.filter(event => event.type === 'llm/quota-warning')).toHaveLength(0)
+  })
+
+  it('F6 trips the ratio floor against the disclosed total', async () => {
+    const h = await harness({
+      ds: [textResponse('done')],
+      gl: [textResponse('unused')],
+    }, priced({
+      warnRatio: 0.05,
+      forecastSteps: 10,
+      static: { ds: { kind: 'balance', remaining: 0.04, total: 1 }, gl: { kind: 'balance', remaining: 100 } },
+    }))
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('forecast-ratio'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    expect(forecastEvents(agent)).toEqual([{
+      turn: 1,
+      step: 1,
+      provider: 'ds',
+      model: 'chat',
+      remaining: 0.04,
+      total: 1,
+      threshold: 0.05,
+      thresholdKind: 'ratio',
+      estimatedCost: 1000 / 1_000_000,
+      inputPrice: 0,
+      outputPrice: 1,
+      projectedBurn: (1000 / 1_000_000) * 10,
+      forecastSteps: 10,
+      reason: 'forecast-low',
+    }])
+  })
+
+  it('F7 reset clears the latch so the next turn warns again', async () => {
+    const h = await harness({
+      ds: [textResponse('one'), textResponse('two')],
+      gl: [textResponse('unused')],
+    }, priced({
+      warnAbsolute: 0.045,
+      forecastSteps: 10,
+      static: { ds: { kind: 'balance', remaining: 0.05 }, gl: { kind: 'balance', remaining: 100 } },
+    }))
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('forecast-reset'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(forecastEvents(agent)).toHaveLength(1)
+
+    expect(h.reset()).toBeDefined()
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(forecastEvents(agent)).toHaveLength(2)
+  })
+
+  it('F8 refines the output projection with the rolling real-usage average', async () => {
+    // No estimatedOutputTokens configured (engine default 1024). Turn 1
+    // reports outputTokens 2000; from turn 2 on, the projection uses that
+    // rolling average (0.002/step) instead of the default (0.001024/step).
+    // The floor 0.0485 sits between the two projections: only the refined
+    // one (remaining 0.05 − 0.002 = 0.048) trips; the default (0.048976)
+    // would stay silent — so the event itself proves the refinement.
+    const usageResponse = (text: string, outputTokens: number): ScriptEntry => [
+      ...textResponse(text),
+      { type: 'usage', usage: { inputTokens: 500, outputTokens } },
+    ]
+    let remaining = 1
+    const h = await harness({
+      ds: [usageResponse('one', 2000), usageResponse('two', 2000)],
+      gl: [textResponse('unused')],
+    }, {
+      fallbacks: [{ provider: 'gl', model: 'opus' }],
+      quota: {
+        warnAbsolute: 0.0485,
+        prices: { ds: { input: 0, output: 1 } },
+        cacheMs: 0,
+        providers: [{ name: 'mutable', check: () => Promise.resolve({ kind: 'balance' as const, remaining }) }],
+      },
+    })
+    ctx = h.ctx
+    const agent = ctx.agentLoop.create(SessionId('forecast-rolling'), { provider: 'ds', model: 'chat' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(forecastEvents(agent)).toHaveLength(0)
+
+    remaining = 0.05
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    expect(forecastEvents(agent)).toEqual([{
+      turn: 2,
+      step: 1,
+      provider: 'ds',
+      model: 'chat',
+      remaining: 0.05,
+      threshold: 0.0485,
+      thresholdKind: 'absolute',
+      estimatedCost: 2000 / 1_000_000,
+      inputPrice: 0,
+      outputPrice: 1,
+      projectedBurn: 2000 / 1_000_000,
+      forecastSteps: 1,
+      reason: 'forecast-low',
+    }])
+  })
+})
+
 describe('concurrency and edge cases', () => {
   let ctx: Context | undefined
 

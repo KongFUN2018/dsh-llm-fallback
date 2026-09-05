@@ -71,6 +71,24 @@ export interface Config {
     preference?: SelectionPreference;
     /** Strategy-mode selection (see docs/strategy-design.md); `closest` (or absent) keeps the legacy lazy chain walk. */
     strategy?: StrategyConfig;
+    /** Post-selection availability probe: before a fallback switch is issued,
+     *  send a minimal real request to the chosen candidate to confirm it is
+     *  actually usable (directory presence ≠ usable; a route can be listed yet
+     *  have no quota or a broken adapter). A candidate that fails the probe is
+     *  banned for the session and the chain advances to the next one. Off by
+     *  default so existing callers without quota/probe knowledge are unaffected;
+     *  enable it in deployments where an unusable candidate must not kill a turn
+     *  (real-host UNKNOWN_MODEL is exactly this class of failure). */
+    probe?: {
+        /** Enable availability probing before issuing a fallback switch. */
+        enabled?: boolean;
+        /** Probe request max output tokens (default 1): the cheapest confirmation. */
+        maxTokens?: number;
+        /** Timeout for one probe (default 6000ms). */
+        timeoutMs?: number;
+        /** Probe prompt; a no-op ping is fine. */
+        prompt?: string;
+    };
     /** Preemptive quota warnings. */
     quota?: {
         /** Switch when remaining allowance falls below this absolute amount. */
@@ -108,6 +126,17 @@ export interface Config {
          * accumulated projected cost reaches it, it stops switching and records a
          * `cost-cap-reached` warning, letting the real failure take over. */
         costCap?: number;
+        /** Advisory floor: warn (WITHOUT switching) when the projected remaining
+         * after `forecastSteps` more steps falls below this absolute amount.
+         * Set it above `thresholdAbsolute` so the heads-up precedes the switch. */
+        warnAbsolute?: number;
+        /** Advisory floor as a ratio: warn (WITHOUT switching) when the projected
+         * remaining/total falls below this value (0..1). */
+        warnRatio?: number;
+        /** Forward horizon in steps for the advisory projection (default 1).
+         * The per-step cost reuses this request's estimate, which over-projects a
+         * growing conversation — deliberate: warn earlier rather than later. */
+        forecastSteps?: number;
     };
 }
 export declare const Config: z<Config>;

@@ -46,6 +46,9 @@ export interface FallbackSwitchRow {
   readonly mode?: 'cost' | 'performance' | 'closest'
   /** The mode's score for the selected route (cost mode: projected cost), when defined. */
   readonly score?: number
+  /** `probe-failed` marks a post-selection availability probe that rejected the
+   *  candidate before it was switched to — the switch was skipped, not completed. */
+  readonly reason?: 'probe-failed'
 }
 
 /** Chat payload of one llm/fallback event. */
@@ -63,11 +66,15 @@ export interface QuotaWarningChatData {
   readonly total?: number
   readonly threshold?: number
   readonly estimatedCost?: number
-  readonly reason: 'below-threshold' | 'insufficient-cost' | 'cost-cap-reached' | 'unobservable'
+  readonly reason: 'below-threshold' | 'insufficient-cost' | 'cost-cap-reached' | 'unobservable' | 'forecast-low' | 'probe-failed'
   /** The configured cumulative-cost cap that was reached (for cost-cap-reached). */
   readonly costCap?: number
   /** The accumulated projected cost at the time the cap was reached. */
   readonly cumulativeCost?: number
+  /** Projected spend of the next forecastSteps steps (for forecast-low). */
+  readonly projectedBurn?: number
+  /** Forward horizon in steps used by the forecast-low projection. */
+  readonly forecastSteps?: number
   /** Strategy mode that selected the target, when a strategy was active. */
   readonly mode?: 'cost' | 'performance' | 'closest'
 }
@@ -103,6 +110,13 @@ function scoreOf(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
 }
 
+/** A finite non-negative amount (balance, threshold, price, or cost) read from
+ * an untrusted payload field. Unlike `count`, fractional values are legitimate:
+ * disclosed balances and per-million-token prices are routinely fractional. */
+function amountOf(value: unknown): number | undefined {
+  return scoreOf(value)
+}
+
 /** Structurally narrow one llm/fallback event payload. */
 function fallbackOf(event: SessionEvent): LlmFallbackEventData | undefined {
   if (event.type !== 'llm/fallback') return undefined
@@ -121,10 +135,12 @@ function fallbackOf(event: SessionEvent): LlmFallbackEventData | undefined {
     || code === undefined || remaining === undefined) return undefined
   const mode = strategyMode(data.mode)
   const score = scoreOf(data.score)
+  const reason = data.reason === 'probe-failed' ? data.reason : undefined
   return {
     turn, step, fromProvider, fromModel, toProvider, toModel, code, remaining,
     ...(mode !== undefined ? { mode } : {}),
     ...(score !== undefined ? { score } : {}),
+    ...(reason !== undefined ? { reason } : {}),
   }
 }
 
@@ -141,15 +157,19 @@ function warningOf(event: SessionEvent): LlmQuotaWarningEventData | undefined {
     return undefined
   }
   if (data.reason !== 'below-threshold' && data.reason !== 'insufficient-cost'
-    && data.reason !== 'cost-cap-reached' && data.reason !== 'unobservable') return undefined
-  const remaining = count(data.remaining)
-  const total = count(data.total)
-  const threshold = count(data.threshold)
-  const estimatedCost = count(data.estimatedCost)
-  const inputPrice = count(data.inputPrice)
-  const outputPrice = count(data.outputPrice)
-  const costCap = count(data.costCap)
-  const cumulativeCost = count(data.cumulativeCost)
+    && data.reason !== 'cost-cap-reached' && data.reason !== 'unobservable'
+    && data.reason !== 'forecast-low' && data.reason !== 'probe-failed') return undefined
+  const remaining = amountOf(data.remaining)
+  const total = amountOf(data.total)
+  const threshold = amountOf(data.threshold)
+  const estimatedCost = amountOf(data.estimatedCost)
+  const inputPrice = amountOf(data.inputPrice)
+  const outputPrice = amountOf(data.outputPrice)
+  const costCap = amountOf(data.costCap)
+  const cumulativeCost = amountOf(data.cumulativeCost)
+  // projectedBurn is a projected currency amount, not an integer count.
+  const projectedBurn = scoreOf(data.projectedBurn)
+  const forecastSteps = count(data.forecastSteps)
   const mode = strategyMode(data.mode)
   return {
     turn, step, provider, model, reason: data.reason,
@@ -161,6 +181,8 @@ function warningOf(event: SessionEvent): LlmQuotaWarningEventData | undefined {
     ...(outputPrice !== undefined ? { outputPrice } : {}),
     ...(costCap !== undefined ? { costCap } : {}),
     ...(cumulativeCost !== undefined ? { cumulativeCost } : {}),
+    ...(projectedBurn !== undefined ? { projectedBurn } : {}),
+    ...(forecastSteps !== undefined ? { forecastSteps } : {}),
     ...(mode !== undefined ? { mode } : {}),
   }
 }
@@ -229,6 +251,7 @@ export const fallbackNodeDefinition: ConversationNodeDefinition<FallbackChatData
         remaining: payload.remaining,
         ...(payload.mode !== undefined ? { mode: payload.mode } : {}),
         ...(payload.score !== undefined ? { score: payload.score } : {}),
+        ...(payload.reason !== undefined ? { reason: payload.reason } : {}),
       }],
     }
   },
@@ -270,6 +293,8 @@ export const quotaWarningNodeDefinition: ConversationNodeDefinition<QuotaWarning
       ...(payload.total !== undefined ? { total: payload.total } : {}),
       ...(payload.threshold !== undefined ? { threshold: payload.threshold } : {}),
       ...(payload.estimatedCost !== undefined ? { estimatedCost: payload.estimatedCost } : {}),
+      ...(payload.projectedBurn !== undefined ? { projectedBurn: payload.projectedBurn } : {}),
+      ...(payload.forecastSteps !== undefined ? { forecastSteps: payload.forecastSteps } : {}),
       ...(payload.mode !== undefined ? { mode: payload.mode } : {}),
     }
   },
